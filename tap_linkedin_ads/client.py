@@ -127,6 +127,7 @@ class LinkedinClient: # pylint: disable=too-many-instance-attributes
                  client_secret,
                  refresh_token,
                  access_token,
+                 accounts,
                  config_path,
                  request_timeout=REQUEST_TIMEOUT,
                  user_agent=None):
@@ -136,6 +137,7 @@ class LinkedinClient: # pylint: disable=too-many-instance-attributes
         self.__config_path = config_path
         self.__user_agent = user_agent
         self.__access_token = access_token
+        self.__accounts = accounts
         self.__expires = None
         self.__session = requests.Session()
         self.__base_url = None
@@ -150,6 +152,10 @@ class LinkedinClient: # pylint: disable=too-many-instance-attributes
     @property
     def access_token(self):
         return self.__access_token
+
+    @property
+    def accounts(self):
+        return self.__accounts
 
     # during 'Timeout' error there is also possibility of 'ConnectionError',
     # hence added backoff for 'ConnectionError' too.
