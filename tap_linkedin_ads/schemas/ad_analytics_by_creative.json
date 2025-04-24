@@ -780,6 +780,12 @@
         "null",
         "integer"
       ]
+    },
+    "approximate_member_reach": {
+      "type": [
+        "null",
+        "integer"
+      ]
     }
   }
 }
