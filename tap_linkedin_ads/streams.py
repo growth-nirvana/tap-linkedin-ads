@@ -25,6 +25,20 @@ FIELDS_UNAVAILABLE_FOR_AD_ANALYTICS = {
     'pivotValue'
 }
 
+ANALYTICS_STREAMS = [
+    "ad_analytics_by_campaign",
+    "ad_analytics_by_creative",
+    "ad_analytics_by_member_company_size",
+    "ad_analytics_by_member_industry",
+    "ad_analytics_by_member_seniority",
+    "ad_analytics_by_member_job_title",
+    "ad_analytics_by_member_job_function",
+    "ad_analytics_by_member_country_v2",
+    "ad_analytics_by_member_region_v2",
+    "ad_analytics_by_member_company",
+    "ad_analytics_by_placement_name"
+]
+
 CURSOR_BASED_PAGINATION_STREAMS = ["accounts", "campaign_groups", "campaigns", "creatives"]
 NEW_PATH_STREAMS = ["campaign_groups", "campaigns", "creatives"]
 BASE_URL = 'https://api.linkedin.com/rest'
@@ -413,7 +427,7 @@ class LinkedInAds:
                                     # The value of the campaigns in the query params should be passed in the encoded format.
                                     # Ref - https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-creatives?view=li-lms-2023-01&tabs=http#sample-request-3
                                     child_stream_params['campaigns'] = 'List(urn%3Ali%3AsponsoredCampaign%3A{})'.format(parent_id)
-                                elif child_stream_name in ('ad_analytics_by_campaign', 'ad_analytics_by_creative'):
+                                elif child_stream_name in (ANALYTICS_STREAMS):
                                     child_stream_params['campaigns[0]'] = campaign
 
                             # Update params for the child stream
@@ -424,7 +438,7 @@ class LinkedInAds:
                                         parent_id)
 
                             # Call sync method for the child stream
-                            if child_stream_name in {'ad_analytics_by_campaign', 'ad_analytics_by_creative'}:
+                            if child_stream_name in ANALYTICS_STREAMS:
                                 child_total_records, child_batch_bookmark_value = child_obj.sync_ad_analytics(
                                     client=client,
                                     catalog=catalog,
@@ -674,7 +688,7 @@ class Campaigns(LinkedInAds):
     account_filter = "search_account_values_param"
     path = "adCampaigns"
     data_key = "elements"
-    children = ["ad_analytics_by_campaign", "creatives", "ad_analytics_by_creative"]
+    children = ["creatives"] + ANALYTICS_STREAMS
     params = {
         "q": "search"
     }
@@ -743,6 +757,162 @@ class AdAnalyticsByCreative(LinkedInAds):
         "count": 10000
     }
 
+class AdAnalyticsByMemberCompanySize(LinkedInAds):
+    """
+    https://docs.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting#analytics-finder
+    """
+    tap_stream_id = "ad_analytics_by_member_company_size"
+    replication_method = "INCREMENTAL"
+    replication_keys = ["end_at"]
+    key_properties = ["campaign_id", "start_at"]
+    account_filter = "accounts_param"
+    path = "adAnalytics"
+    foreign_key = "id"
+    data_key = "elements"
+    parent = "campaigns"
+    params = {
+        "q": "analytics",
+        "pivot": "MEMBER_COMPANY_SIZE",
+        "timeGranularity": "MONTHLY",
+        "count": 10000
+    }
+
+class AdAnalyticsByMemberIndustry(LinkedInAds):
+    tap_stream_id = "ad_analytics_by_member_industry"
+    replication_method = "INCREMENTAL"
+    replication_keys = ["end_at"]
+    key_properties = ["campaign_id", "start_at"]
+    account_filter = "accounts_param"
+    path = "adAnalytics"
+    foreign_key = "id"
+    data_key = "elements"
+    parent = "campaigns"
+    params = {
+        "q": "analytics",
+        "pivot": "MEMBER_INDUSTRY",
+        "timeGranularity": "MONTHLY",
+        "count": 10000
+    }
+
+class AdAnalyticsByMemberSeniority(LinkedInAds):
+    tap_stream_id = "ad_analytics_by_member_seniority"
+    replication_method = "INCREMENTAL"
+    replication_keys = ["end_at"]
+    key_properties = ["campaign_id", "start_at"]
+    account_filter = "accounts_param"
+    path = "adAnalytics"
+    foreign_key = "id"
+    data_key = "elements"
+    parent = "campaigns"
+    params = {
+        "q": "analytics",
+        "pivot": "MEMBER_SENIORITY",
+        "timeGranularity": "MONTHLY",
+        "count": 10000
+    }
+
+class AdAnalyticsByMemberJobTitle(LinkedInAds):
+    tap_stream_id = "ad_analytics_by_member_job_title"
+    replication_method = "INCREMENTAL"
+    replication_keys = ["end_at"]
+    key_properties = ["campaign_id", "start_at"]
+    account_filter = "accounts_param"
+    path = "adAnalytics"
+    foreign_key = "id"
+    data_key = "elements"
+    parent = "campaigns"
+    params = {
+        "q": "analytics",
+        "pivot": "MEMBER_JOB_TITLE",
+        "timeGranularity": "MONTHLY",
+        "count": 10000
+    }
+
+class AdAnalyticsByMemberJobFunction(LinkedInAds):
+    tap_stream_id = "ad_analytics_by_member_job_function"
+    replication_method = "INCREMENTAL"
+    replication_keys = ["end_at"]
+    key_properties = ["campaign_id", "start_at"]
+    account_filter = "accounts_param"
+    path = "adAnalytics"
+    foreign_key = "id"
+    data_key = "elements"
+    parent = "campaigns"
+    params = {
+        "q": "analytics",
+        "pivot": "MEMBER_JOB_FUNCTION",
+        "timeGranularity": "MONTHLY",
+        "count": 10000
+    }
+
+class AdAnalyticsByMemberCountryV2(LinkedInAds):
+    tap_stream_id = "ad_analytics_by_member_country_v2"
+    replication_method = "INCREMENTAL"
+    replication_keys = ["end_at"]
+    key_properties = ["campaign_id", "start_at"]
+    account_filter = "accounts_param"
+    path = "adAnalytics"
+    foreign_key = "id"
+    data_key = "elements"
+    parent = "campaigns"
+    params = {
+        "q": "analytics",
+        "pivot": "MEMBER_COUNTRY_V2",
+        "timeGranularity": "MONTHLY",
+        "count": 10000
+    }
+
+class AdAnalyticsByMemberRegionV2(LinkedInAds):
+    tap_stream_id = "ad_analytics_by_member_region_v2"
+    replication_method = "INCREMENTAL"
+    replication_keys = ["end_at"]
+    key_properties = ["campaign_id", "start_at"]
+    account_filter = "accounts_param"
+    path = "adAnalytics"
+    foreign_key = "id"
+    data_key = "elements"
+    parent = "campaigns"
+    params = {
+        "q": "analytics",
+        "pivot": "MEMBER_REGION_V2",
+        "timeGranularity": "MONTHLY",
+        "count": 10000
+    }
+
+class AdAnalyticsByMemberCompany(LinkedInAds):
+    tap_stream_id = "ad_analytics_by_member_company"
+    replication_method = "INCREMENTAL"
+    replication_keys = ["end_at"]
+    key_properties = ["campaign_id", "start_at"]
+    account_filter = "accounts_param"
+    path = "adAnalytics"
+    foreign_key = "id"
+    data_key = "elements"
+    parent = "campaigns"
+    params = {
+        "q": "analytics",
+        "pivot": "MEMBER_COMPANY",
+        "timeGranularity": "MONTHLY",
+        "count": 10000
+    }
+
+class AdAnalyticsByPlacementName(LinkedInAds):
+    tap_stream_id = "ad_analytics_by_placement_name"
+    replication_method = "INCREMENTAL"
+    replication_keys = ["end_at"]
+    key_properties = ["campaign_id", "start_at"]
+    account_filter = "accounts_param"
+    path = "adAnalytics"
+    foreign_key = "id"
+    data_key = "elements"
+    parent = "campaigns"
+    params = {
+        "q": "analytics",
+        "pivot": "PLACEMENT_NAME",
+        "timeGranularity": "MONTHLY",
+        "count": 10000
+    }
+
 # Dictionary of the stream classes
 STREAMS = {
     "accounts": Accounts,
@@ -752,5 +922,14 @@ STREAMS = {
     "campaigns": Campaigns,
     "creatives": Creatives,
     "ad_analytics_by_campaign": AdAnalyticsByCampaign,
-    "ad_analytics_by_creative": AdAnalyticsByCreative
+    "ad_analytics_by_creative": AdAnalyticsByCreative,
+    "ad_analytics_by_member_company_size": AdAnalyticsByMemberCompanySize,
+    "ad_analytics_by_member_industry": AdAnalyticsByMemberIndustry,
+    "ad_analytics_by_member_seniority": AdAnalyticsByMemberSeniority,
+    "ad_analytics_by_member_job_title": AdAnalyticsByMemberJobTitle,
+    "ad_analytics_by_member_job_function": AdAnalyticsByMemberJobFunction,
+    "ad_analytics_by_member_country_v2": AdAnalyticsByMemberCountryV2,
+    "ad_analytics_by_member_region_v2": AdAnalyticsByMemberRegionV2,
+    "ad_analytics_by_member_company": AdAnalyticsByMemberCompany,
+    "ad_analytics_by_placement_name": AdAnalyticsByPlacementName
 }
