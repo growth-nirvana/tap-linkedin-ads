@@ -506,8 +506,15 @@ class LinkedInAds:
         window_end_date = window_start_date + timedelta(days=date_window_size)
         today = datetime.date.today()
 
-        # Reset end_date of date window if it is greater than today
-        window_end_date = min(window_end_date, today)
+        # Ensure end_date is not in the future
+        if window_end_date > today:
+            window_end_date = today
+        # Ensure start_date is not in the future
+        if window_start_date > today:
+            window_start_date = today
+        # Ensure start_date is not after end_date
+        if window_start_date > window_end_date:
+            window_start_date = window_end_date
 
         # Override the default start and end dates
         static_params = {**self.params,
@@ -549,8 +556,8 @@ class LinkedInAds:
         # Considering, 1 Ad is active and the existing behavior of the tap uses 30 Day window size
         #       and timeGranularity = DAILY(Results grouped by day) we get 30 records in one API response
         # Considering the maximum permitted size of Ads are created, "3000" records will be returned in an API response.
-        # If “count=100” and records=100 in the API are the same then the next URL will be returned and if we hit that URL, 400 error code will be returned.
-        # This case is unreachable because here “count” is 10000 and at maximum, only 3000 records will be returned in an API response.
+        # If "count=100" and records=100 in the API are the same then the next URL will be returned and if we hit that URL, 400 error code will be returned.
+        # This case is unreachable because here "count" is 10000 and at maximum, only 3000 records will be returned in an API response.
 
         total_records = 0
         while window_end_date <= today:
