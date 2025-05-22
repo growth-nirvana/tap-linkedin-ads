@@ -697,7 +697,15 @@ class Campaigns(LinkedInAds):
     data_key = "elements"
     children = ["creatives"] + ANALYTICS_STREAMS
     params = {
-        "q": "search"
+        "q": "search",
+        "search.status.values[0]": "ACTIVE",
+        "search.status.values[1]": "PAUSED",
+        "search.status.values[2]": "ARCHIVED",
+        "search.status.values[3]": "COMPLETED",
+        "search.status.values[4]": "CANCELED",
+        "search.status.values[5]": "DRAFT",
+        "search.status.values[6]": "PENDING_DELETION",
+        "search.status.values[7]": "REMOVED"
     }
 
 class Creatives(LinkedInAds):
