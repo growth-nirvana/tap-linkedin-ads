@@ -493,6 +493,12 @@
         }
       ]
     },
+    "pivot_value_name": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
     "reactions": {
       "type": [
         "null",

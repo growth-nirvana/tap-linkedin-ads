@@ -11,6 +11,26 @@ from tap_linkedin_ads.transform import transform_json, snake_case_to_camel_case
 
 LOGGER = singer.get_logger()
 
+def resolve_geo_name(client, geo_urn):
+    """
+    Resolve a geo URN to its human-readable name.
+    Works for both countries and regions.
+    Examples:
+        urn:li:geo:102890719 -> Netherlands (country)
+        urn:li:geo:103644278 -> California (region)
+    """
+    try:
+        # Extract the geo code from the URN
+        geo_code = geo_urn.split(':')[-1]
+        # Make API call to get geo details using v2 geo endpoint
+        url = f"https://api.linkedin.com/v2/geo/{geo_code}?locale.language=en&locale.country=US"
+        response = client.get(url=url, endpoint='geo')
+        if response and 'defaultLocalizedName' in response:
+            return response['defaultLocalizedName']['value']
+    except Exception as e:
+        LOGGER.warning(f"Failed to resolve geo name for {geo_urn}: {str(e)}")
+    return geo_code
+
 # Below fields are a list of foreign keys(primary key of a parent) and replication keys that API can not accept in the parameters.
 # We will skip these fields while passing selected fields in the API parameters.
 FIELDS_UNAVAILABLE_FOR_AD_ANALYTICS = {
@@ -149,7 +169,7 @@ def shift_sync_window(params, today, date_window_size, forced_window_size=None):
                   'dateRange.end.year': new_end.year,}
     return current_end, new_end, new_params
 
-def merge_responses(pivot, data):
+def merge_responses(pivot, data, client=None, stream_name=None):
     """
     Prepare map with key as primary key and value as the record itself for analytics streams.
     The primary key is a combination of pivotValue and start date fields value.
@@ -165,6 +185,12 @@ def merge_responses(pivot, data):
             # adding pivot and pivot_value to make it compatible with the previous tap version
             element['pivot'] = pivot
             element["pivot_value"] = temp_pivotValue
+
+            # Enrichment logic
+            if client:
+                if stream_name in ["ad_analytics_by_member_country_v2", "ad_analytics_by_member_region_v2"]:
+                    element["pivot_value_name"] = resolve_geo_name(client, temp_pivotValue)
+
             string_start = '{}-{}-{}'.format(temp_start['year'], temp_start['month'], temp_start['day'])
             primary_key = (temp_pivotValue, string_start)
             if primary_key in full_records:
@@ -572,7 +598,7 @@ class LinkedInAds:
                     if page.get(self.data_key):
                         responses.append(page.get(self.data_key))
             pivot = params["pivot"] if "pivot" in params.keys() else None
-            raw_records = merge_responses(pivot, responses)
+            raw_records = merge_responses(pivot, responses, client, self.tap_stream_id)
             time_extracted = utils.now()
 
             # While we broke the ad_analytics streams out from
