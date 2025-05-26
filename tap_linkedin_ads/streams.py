@@ -42,7 +42,8 @@ FIELDS_UNAVAILABLE_FOR_AD_ANALYTICS = {
     'creativeId',
     # `pivot` and `pivotValue` is not supported anymore, adding values within the code
     'pivot',
-    'pivotValue'
+    'pivotValue',
+    'pivotValueName'  # This field is not available in the API schema
 }
 
 ANALYTICS_STREAMS = [
