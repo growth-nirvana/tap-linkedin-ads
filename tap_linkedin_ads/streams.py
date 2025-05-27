@@ -8,28 +8,56 @@ from singer import metrics, metadata, utils
 from singer import Transformer, should_sync_field, UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING
 from singer.utils import strptime_to_utc, strftime
 from tap_linkedin_ads.transform import transform_json, snake_case_to_camel_case
+import json
 
 LOGGER = singer.get_logger()
 
-def resolve_geo_name(client, geo_urn):
+# Add geo name cache at module level
+GEO_NAME_CACHE = {}
+
+def batch_resolve_geo_names(client, geo_urns):
     """
-    Resolve a geo URN to its human-readable name.
-    Works for both countries and regions.
-    Examples:
-        urn:li:geo:102890719 -> Netherlands (country)
-        urn:li:geo:103644278 -> California (region)
+    Resolve multiple geo URNs in a single batch request.
+    Returns a dictionary mapping geo codes to their resolved names.
     """
+    if not geo_urns:
+        return {}
+
+    # Extract unique geo codes
+    geo_codes = {urn.split(':')[-1] for urn in geo_urns}
+    
     try:
-        # Extract the geo code from the URN
-        geo_code = geo_urn.split(':')[-1]
-        # Make API call to get geo details using v2 geo endpoint
-        url = f"https://api.linkedin.com/v2/geo/{geo_code}?locale.language=en&locale.country=US"
-        response = client.get(url=url, endpoint='geo')
-        if response and 'defaultLocalizedName' in response:
-            return response['defaultLocalizedName']['value']
+        # Construct batch request URL - using just the IDs
+        batch_params = ','.join(geo_codes)
+        url = f"https://api.linkedin.com/v2/geo?ids=List({batch_params})&locale=(language:en,country:US)"
+        LOGGER.info(f"Making batch request to URL: {url}")
+        
+        # Add required header
+        headers = {'X-Restli-Protocol-Version': '2.0.0'}
+        response = client.get(url=url, endpoint='geo', headers=headers)
+        LOGGER.info(f"Geo API response: {json.dumps(response, indent=2)}")
+        
+        resolved = {}
+        if response and 'results' in response:
+            for code, result in response['results'].items():
+                if isinstance(result, dict) and 'defaultLocalizedName' in result:
+                    name = result['defaultLocalizedName']['value']
+                    resolved[code] = name
+                else:
+                    resolved[code] = code
+                    
     except Exception as e:
-        LOGGER.warning(f"Failed to resolve geo name for {geo_urn}: {str(e)}")
-    return geo_code
+        if "429" in str(e):
+            LOGGER.warning(f"Rate limit hit while batch resolving geo names. Using geo codes as fallback.")
+        else:
+            LOGGER.warning(f"Failed to batch resolve geo names: {str(e)}")
+        
+        # Add unresolved codes to resolved dict with code as value
+        for code in geo_codes:
+            if code not in resolved:
+                resolved[code] = code
+
+    return resolved
 
 # Below fields are a list of foreign keys(primary key of a parent) and replication keys that API can not accept in the parameters.
 # We will skip these fields while passing selected fields in the API parameters.
@@ -177,7 +205,8 @@ def merge_responses(pivot, data, client=None, stream_name=None):
     Update existing records with the same primary key value.
     """
     full_records = {}
-    # Loop through each page of data
+    geo_urns_to_resolve = set()
+    
     for page in data:
         # Loop through each record of the page
         for element in page:
@@ -187,10 +216,9 @@ def merge_responses(pivot, data, client=None, stream_name=None):
             element['pivot'] = pivot
             element["pivot_value"] = temp_pivotValue
 
-            # Enrichment logic
-            if client:
-                if stream_name in ["ad_analytics_by_member_country_v2", "ad_analytics_by_member_region_v2"]:
-                    element["pivot_value_name"] = resolve_geo_name(client, temp_pivotValue)
+            # Collect geo URNs for resolution
+            if client and stream_name in ["ad_analytics_by_member_country_v2", "ad_analytics_by_member_region_v2"]:
+                geo_urns_to_resolve.add(temp_pivotValue)
 
             string_start = '{}-{}-{}'.format(temp_start['year'], temp_start['month'], temp_start['day'])
             primary_key = (temp_pivotValue, string_start)
@@ -199,6 +227,15 @@ def merge_responses(pivot, data, client=None, stream_name=None):
                 full_records[primary_key].update(element)
             else:
                 full_records[primary_key] = element
+
+    # Batch resolve all geo names if needed
+    if client and stream_name in ["ad_analytics_by_member_country_v2", "ad_analytics_by_member_region_v2"]:
+        resolved_names = batch_resolve_geo_names(client, geo_urns_to_resolve)
+        # Update records with resolved names
+        for record in full_records.values():
+            if record["pivot_value"] in resolved_names:
+                record["pivot_value_name"] = resolved_names[record["pivot_value"]]
+
     return full_records
 
 class LinkedInAds:
