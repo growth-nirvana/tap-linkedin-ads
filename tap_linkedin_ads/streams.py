@@ -26,36 +26,40 @@ def batch_resolve_geo_names(client, geo_urns):
     # Extract unique geo codes
     geo_codes = {urn.split(':')[-1] for urn in geo_urns}
     
-    try:
-        # Construct batch request URL - using just the IDs
-        batch_params = ','.join(geo_codes)
-        url = f"https://api.linkedin.com/v2/geo?ids=List({batch_params})&locale=(language:en,country:US)"
-        LOGGER.info(f"Making batch request to URL: {url}")
-        
-        # Add required header
-        headers = {'X-Restli-Protocol-Version': '2.0.0'}
-        response = client.get(url=url, endpoint='geo', headers=headers)
-        LOGGER.info(f"Geo API response: {json.dumps(response, indent=2)}")
-        
-        resolved = {}
-        if response and 'results' in response:
-            for code, result in response['results'].items():
-                if isinstance(result, dict) and 'defaultLocalizedName' in result:
-                    name = result['defaultLocalizedName']['value']
-                    resolved[code] = name
-                else:
+    # Split into chunks of 150 (LinkedIn's batch limit)
+    chunk_size = 150
+    geo_code_chunks = [list(geo_codes)[i:i + chunk_size] for i in range(0, len(geo_codes), chunk_size)]
+    
+    resolved = {}
+    for chunk in geo_code_chunks:
+        try:
+            # Construct batch request URL for this chunk
+            batch_params = ','.join(chunk)
+            url = f"https://api.linkedin.com/v2/geo?ids=List({batch_params})&locale=(language:en,country:US)"
+            LOGGER.info(f"Making batch request to URL: {url}")
+            
+            # Add required header
+            headers = {'X-Restli-Protocol-Version': '2.0.0'}
+            response = client.get(url=url, endpoint='geo', headers=headers)
+            
+            if response and 'results' in response:
+                for code, result in response['results'].items():
+                    if isinstance(result, dict) and 'defaultLocalizedName' in result:
+                        name = result['defaultLocalizedName']['value']
+                        resolved[code] = name
+                    else:
+                        resolved[code] = code
+                        
+        except Exception as e:
+            if "429" in str(e):
+                LOGGER.warning(f"Rate limit hit while batch resolving geo names for chunk. Using geo codes as fallback.")
+            else:
+                LOGGER.warning(f"Failed to batch resolve geo names for chunk: {str(e)}")
+            
+            # Add unresolved codes from this chunk to resolved dict with code as value
+            for code in chunk:
+                if code not in resolved:
                     resolved[code] = code
-                    
-    except Exception as e:
-        if "429" in str(e):
-            LOGGER.warning(f"Rate limit hit while batch resolving geo names. Using geo codes as fallback.")
-        else:
-            LOGGER.warning(f"Failed to batch resolve geo names: {str(e)}")
-        
-        # Add unresolved codes to resolved dict with code as value
-        for code in geo_codes:
-            if code not in resolved:
-                resolved[code] = code
 
     return resolved
 
