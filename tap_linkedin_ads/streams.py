@@ -237,8 +237,8 @@ def merge_responses(pivot, data, client=None, stream_name=None):
         resolved_names = batch_resolve_geo_names(client, geo_urns_to_resolve)
         # Update records with resolved names
         for record in full_records.values():
-            if record["pivot_value"] in resolved_names:
-                record["pivot_value_name"] = resolved_names[record["pivot_value"]]
+            geo_code = record["pivot_value"].split(':')[-1]
+            record["pivot_value_name"] = resolved_names[geo_code]
 
     return full_records
 
