@@ -368,8 +368,11 @@ class LinkedinClient: # pylint: disable=too-many-instance-attributes
         # https://learn.microsoft.com/en-us/linkedin/shared/api-guide/concepts/query-tunneling?context=linkedin/context
         if method == 'GET':
             if url:
-                url, query = url.split('?', 1)
-                kwargs['data'] = query
+                if '?' in url:
+                    url, query = url.split('?', 1)
+                    kwargs['data'] = query
+                else:
+                    kwargs['data'] = ''
             kwargs['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
             kwargs['headers']['X-HTTP-Method-Override'] = 'GET'
 

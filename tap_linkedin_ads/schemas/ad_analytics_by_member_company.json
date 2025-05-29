@@ -480,6 +480,12 @@
         "string"
       ]
     },
+    "pivot_value_name": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
     "pivot_values": {
       "anyOf": [
         {

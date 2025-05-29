@@ -8,60 +8,22 @@ from singer import metrics, metadata, utils
 from singer import Transformer, should_sync_field, UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING
 from singer.utils import strptime_to_utc, strftime
 from tap_linkedin_ads.transform import transform_json, snake_case_to_camel_case
+from tap_linkedin_ads.urn_resolver import resolve_urns
 import json
 
 LOGGER = singer.get_logger()
 
-# Add geo name cache at module level
-GEO_NAME_CACHE = {}
-
-def batch_resolve_geo_names(client, geo_urns):
+def batch_resolve_urns(client, urns, endpoint, name_path, locale=None):
     """
-    Resolve multiple geo URNs in a single batch request.
-    Returns a dictionary mapping geo codes to their resolved names.
+    Generic function to resolve URNs in batch.
+    Args:
+        client: API client
+        urns: Set of URNs to resolve
+        endpoint: API endpoint to use ('geo', 'functions', or 'titles')
+        name_path: Path to extract name from response (e.g. ['defaultLocalizedName', 'value'] or ['name', 'localized', 'en_US'])
+        locale: Optional locale parameter for the API
     """
-    if not geo_urns:
-        return {}
-
-    # Extract unique geo codes
-    geo_codes = {urn.split(':')[-1] for urn in geo_urns}
-    
-    # Split into chunks of 150 (LinkedIn's batch limit)
-    chunk_size = 150
-    geo_code_chunks = [list(geo_codes)[i:i + chunk_size] for i in range(0, len(geo_codes), chunk_size)]
-    
-    resolved = {}
-    for chunk in geo_code_chunks:
-        try:
-            # Construct batch request URL for this chunk
-            batch_params = ','.join(chunk)
-            url = f"https://api.linkedin.com/v2/geo?ids=List({batch_params})&locale=(language:en,country:US)"
-            LOGGER.info(f"Making batch request to URL: {url}")
-            
-            # Add required header
-            headers = {'X-Restli-Protocol-Version': '2.0.0'}
-            response = client.get(url=url, endpoint='geo', headers=headers)
-            
-            if response and 'results' in response:
-                for code, result in response['results'].items():
-                    if isinstance(result, dict) and 'defaultLocalizedName' in result:
-                        name = result['defaultLocalizedName']['value']
-                        resolved[code] = name
-                    else:
-                        resolved[code] = code
-                        
-        except Exception as e:
-            if "429" in str(e):
-                LOGGER.warning(f"Rate limit hit while batch resolving geo names for chunk. Using geo codes as fallback.")
-            else:
-                LOGGER.warning(f"Failed to batch resolve geo names for chunk: {str(e)}")
-            
-            # Add unresolved codes from this chunk to resolved dict with code as value
-            for code in chunk:
-                if code not in resolved:
-                    resolved[code] = code
-
-    return resolved
+    return resolve_urns(client, urns, endpoint, locale)
 
 # Below fields are a list of foreign keys(primary key of a parent) and replication keys that API can not accept in the parameters.
 # We will skip these fields while passing selected fields in the API parameters.
@@ -209,7 +171,43 @@ def merge_responses(pivot, data, client=None, stream_name=None):
     Update existing records with the same primary key value.
     """
     full_records = {}
-    geo_urns_to_resolve = set()
+    urns_to_resolve = set()
+    
+    # Define resolution configs for different streams
+    resolution_configs = {
+        "ad_analytics_by_member_country_v2": {
+            "endpoint": "geo",
+            "locale": "(language:en,country:US)"
+        },
+        "ad_analytics_by_member_region_v2": {
+            "endpoint": "geo",
+            "locale": "(language:en,country:US)"
+        },
+        "ad_analytics_by_member_job_function": {
+            "endpoint": "functions",
+            "name_path": ['name', 'localized', 'en_US'],
+            "locale": "en_US"
+        },
+        "ad_analytics_by_member_job_title": {
+            "endpoint": "titles",
+            "name_path": ['name', 'localized', 'en_US'],
+            "locale": "en_US"
+        },
+        "ad_analytics_by_member_industry": {
+            "endpoint": "industries",
+            "name_path": ['name', 'localized', 'en_US'],
+            "locale": "(language:en,country:US)"
+        },
+        "ad_analytics_by_member_company": {
+            "endpoint": "organizations",
+            "name_path": ['name', 'localized', 'en_US']
+        },
+        "ad_analytics_by_member_seniority": {
+            "endpoint": "seniorities",
+            "name_path": ["name", "localized", "en_US"],
+            "locale": None
+        },
+    }
     
     for page in data:
         # Loop through each record of the page
@@ -220,9 +218,9 @@ def merge_responses(pivot, data, client=None, stream_name=None):
             element['pivot'] = pivot
             element["pivot_value"] = temp_pivotValue
 
-            # Collect geo URNs for resolution
-            if client and stream_name in ["ad_analytics_by_member_country_v2", "ad_analytics_by_member_region_v2"]:
-                geo_urns_to_resolve.add(temp_pivotValue)
+            # Collect URNs for resolution
+            if client and stream_name in resolution_configs:
+                urns_to_resolve.add(temp_pivotValue)
 
             string_start = '{}-{}-{}'.format(temp_start['year'], temp_start['month'], temp_start['day'])
             primary_key = (temp_pivotValue, string_start)
@@ -232,13 +230,20 @@ def merge_responses(pivot, data, client=None, stream_name=None):
             else:
                 full_records[primary_key] = element
 
-    # Batch resolve all geo names if needed
-    if client and stream_name in ["ad_analytics_by_member_country_v2", "ad_analytics_by_member_region_v2"]:
-        resolved_names = batch_resolve_geo_names(client, geo_urns_to_resolve)
+    # Resolve names if needed
+    if client and stream_name in resolution_configs:
+        config = resolution_configs[stream_name]
+        resolved_names = batch_resolve_urns(
+            client, 
+            urns_to_resolve, 
+            config["endpoint"],
+            config.get("name_path"),
+            config.get("locale")
+        )
         # Update records with resolved names
         for record in full_records.values():
-            geo_code = record["pivot_value"].split(':')[-1]
-            record["pivot_value_name"] = resolved_names[geo_code]
+            code = record["pivot_value"].split(':')[-1]
+            record["pivot_value_name"] = resolved_names.get(code, code)
 
     return full_records
 
