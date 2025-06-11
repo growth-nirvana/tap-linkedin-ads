@@ -346,22 +346,32 @@ class LinkedInAds:
                         record,
                         schema,
                         stream_metadata)
-                    # Check replication key value if it is available in the record
-                    if bookmark_field and (bookmark_field in transformed_record):
-                        # Reset max_bookmark_value to new value if higher
-                        if max_bookmark_value is None or strptime_to_utc(transformed_record[bookmark_field]) > strptime_to_utc(max_bookmark_value):
-                            max_bookmark_value = transformed_record[bookmark_field]
-
-                        last_dttm = strptime_to_utc(last_datetime)
-                        bookmark_dttm = strptime_to_utc(transformed_record[bookmark_field])
-                        # Keep only records whose bookmark is after the last_datetime
-                        if bookmark_dttm >= last_dttm:
-                            self.write_record(transformed_record, time_extracted=time_extracted)
-                            counter.increment()
-                    else:
-                        # Write record if replication key is not available in the record
+                    
+                    # For FULL_TABLE replication, always write the record
+                    if self.replication_method == "FULL_TABLE":
                         self.write_record(transformed_record, time_extracted=time_extracted)
                         counter.increment()
+                        # Still track max bookmark for state
+                        if bookmark_field and (bookmark_field in transformed_record):
+                            if max_bookmark_value is None or strptime_to_utc(transformed_record[bookmark_field]) > strptime_to_utc(max_bookmark_value):
+                                max_bookmark_value = transformed_record[bookmark_field]
+                    else:
+                        # For INCREMENTAL replication, check bookmark values
+                        if bookmark_field and (bookmark_field in transformed_record):
+                            # Reset max_bookmark_value to new value if higher
+                            if max_bookmark_value is None or strptime_to_utc(transformed_record[bookmark_field]) > strptime_to_utc(max_bookmark_value):
+                                max_bookmark_value = transformed_record[bookmark_field]
+
+                            last_dttm = strptime_to_utc(last_datetime)
+                            bookmark_dttm = strptime_to_utc(transformed_record[bookmark_field])
+                            # Keep only records whose bookmark is after the last_datetime
+                            if bookmark_dttm >= last_dttm:
+                                self.write_record(transformed_record, time_extracted=time_extracted)
+                                counter.increment()
+                        else:
+                            # Write record if replication key is not available in the record
+                            self.write_record(transformed_record, time_extracted=time_extracted)
+                            counter.increment()
 
             return max_bookmark_value, counter.value
 
@@ -685,7 +695,7 @@ class Accounts(LinkedInAds):
     https://docs.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-accounts#search-for-accounts
     """
     tap_stream_id = "accounts"
-    replication_method = "INCREMENTAL"
+    replication_method = "FULL_TABLE"
     replication_keys = ["last_modified_time"]
     key_properties = ["id"]
     account_filter = "search_id_values_param"
@@ -733,7 +743,7 @@ class AccountUsers(LinkedInAds):
     """
     tap_stream_id = "account_users"
     replication_keys = ["last_modified_time"]
-    replication_method = "INCREMENTAL"
+    replication_method = "FULL_TABLE"
     key_properties = ["account_id", "user_person_id"]
     account_filter = "accounts_param"
     path = "adAccountUsers"
@@ -747,7 +757,7 @@ class CampaignGroups(LinkedInAds):
     https://docs.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-campaign-groups#search-for-campaign-groups
     """
     tap_stream_id = "campaign_groups"
-    replication_method = "INCREMENTAL"
+    replication_method = "FULL_TABLE"
     replication_keys = ["last_modified_time"]
     key_properties = ["id"]
     account_filter = "search_account_values_param"
@@ -762,7 +772,7 @@ class Campaigns(LinkedInAds):
     https://docs.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-campaigns#search-for-campaigns
     """
     tap_stream_id = "campaigns"
-    replication_method = "INCREMENTAL"
+    replication_method = "FULL_TABLE"
     replication_keys = ["last_modified_time"]
     key_properties = ["id"]
     account_filter = "search_account_values_param"
@@ -786,7 +796,7 @@ class Creatives(LinkedInAds):
     https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-creatives?view=li-lms-2023-01&tabs=http#search-for-creatives
     """
     tap_stream_id = "creatives"
-    replication_method = "INCREMENTAL"
+    replication_method = "FULL_TABLE"
     replication_keys = ["last_modified_at"]
     key_properties = ["id"]
     path = "creatives"
