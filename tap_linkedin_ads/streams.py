@@ -25,6 +25,34 @@ def batch_resolve_urns(client, urns, endpoint, name_path, locale=None):
     """
     return resolve_urns(client, urns, endpoint, locale)
 
+def batch_resolve_share_urns(client, share_urns):
+    """
+    Resolve share URNs in batch.
+    Args:
+        client: API client
+        share_urns: Set of share URNs to resolve
+    """
+    if not share_urns:
+        return {}
+
+    resolved_shares = {}
+    # Process in batches of 100
+    share_urn_list = list(share_urns)
+    for i in range(0, len(share_urn_list), 100):
+        batch_urns = share_urn_list[i:i+100]
+        share_ids = [urn.split(':')[-1] for urn in batch_urns]
+        ids_param = f"List({','.join(share_ids)})"
+        path = f"shares?ids={ids_param}"
+
+        response = client.get(url=f'https://api.linkedin.com/rest/{path}', endpoint='shares')
+
+        if response and 'results' in response:
+            for share_id, share_data in response['results'].items():
+                urn = f'urn:li:share:{share_id}'
+                resolved_shares[urn] = share_data
+
+    return resolved_shares
+
 # Below fields are a list of foreign keys(primary key of a parent) and replication keys that API can not accept in the parameters.
 # We will skip these fields while passing selected fields in the API parameters.
 FIELDS_UNAVAILABLE_FOR_AD_ANALYTICS = {
@@ -164,7 +192,7 @@ def shift_sync_window(params, today, date_window_size, forced_window_size=None):
                   'dateRange.end.year': new_end.year,}
     return current_end, new_end, new_params
 
-def merge_responses(pivot, data, client=None, stream_name=None):
+def merge_responses(pivot, data, client=None, stream_name=None, parent_id=None):
     """
     Prepare map with key as primary key and value as the record itself for analytics streams.
     The primary key is a combination of pivotValue and start date fields value.
@@ -217,6 +245,7 @@ def merge_responses(pivot, data, client=None, stream_name=None):
             # adding pivot and pivot_value to make it compatible with the previous tap version
             element['pivot'] = pivot
             element["pivot_value"] = temp_pivotValue
+            element["campaign_id"] = parent_id
 
             # Collect URNs for resolution
             if client and stream_name in resolution_configs:
@@ -282,6 +311,10 @@ class LinkedInAds:
     count = None
     params = {}
     headers = {}
+
+    def __init__(self, client=None):
+        self.client = client
+
     def write_schema(self, catalog):
         """
         Write the schema for the selected stream.
@@ -494,7 +527,8 @@ class LinkedInAds:
                 for child_stream_name in children:
                     if child_stream_name in selected_streams:
                         # For each parent record
-                        child_obj = STREAMS[child_stream_name]()
+                        # child_obj = STREAMS[child_stream_name]()
+                        child_obj = STREAMS[child_stream_name](client=client)
 
                         for record in pre_singer_transformed_data:
 
@@ -655,7 +689,7 @@ class LinkedInAds:
                     if page.get(self.data_key):
                         responses.append(page.get(self.data_key))
             pivot = params["pivot"] if "pivot" in params.keys() else None
-            raw_records = merge_responses(pivot, responses, client, self.tap_stream_id)
+            raw_records = merge_responses(pivot, responses, client, self.tap_stream_id, parent_id)
             time_extracted = utils.now()
 
             # While we broke the ad_analytics streams out from
@@ -814,6 +848,36 @@ class Creatives(LinkedInAds):
     # Ref - https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads/account-structure/create-and-manage-creatives?view=li-lms-2023-01&tabs=http#search-for-creatives
     headers = {'X-Restli-Protocol-Version': "2.0.0",
                "X-RestLi-Method": "FINDER"}
+
+    # def process_records(self, catalog, records, time_extracted, bookmark_field=None, max_bookmark_value=None, last_datetime=None, parent_id=None):
+    #     share_urns_to_resolve = {
+    #         r['content']['reference'] for r in records 
+    #         if r.get('content', {}).get('reference', '').startswith('urn:li:share:')
+    #     }
+
+    #     enriched_records = []
+    #     if not share_urns_to_resolve:
+    #         enriched_records = records
+    #     else:
+    #         # NOTE: This line will cause the next error. See Step 3 below.
+    #         resolved_shares = batch_resolve_share_urns(self.client, share_urns_to_resolve)
+    #         for record in records:
+    #             share_urn = record.get('content', {}).get('reference')
+    #             if share_urn in resolved_shares:
+    #                 record['share_content'] = resolved_shares[share_urn]
+    #             enriched_records.append(record)
+
+    #     # Now, call the ORIGINAL process_records from the base class
+    #     # with the newly enriched records.
+    #     return super().process_records(
+    #         catalog=catalog,
+    #         records=enriched_records,
+    #         time_extracted=time_extracted,
+    #         bookmark_field=bookmark_field,
+    #         max_bookmark_value=max_bookmark_value,
+    #         last_datetime=last_datetime,
+    #         parent_id=parent_id
+    #     )
 
 class AdAnalyticsByCampaign(LinkedInAds):
     """
