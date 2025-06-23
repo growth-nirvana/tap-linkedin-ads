@@ -3,6 +3,8 @@ import re
 import copy
 import datetime
 from datetime import timedelta
+from dateutil.parser import parse
+from dateutil.relativedelta import relativedelta
 import singer
 from singer import metrics, metadata, utils
 from singer import Transformer, should_sync_field, UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING
@@ -89,7 +91,36 @@ BASE_URL = 'https://api.linkedin.com/rest'
 def write_bookmark(state, value, stream_name):
     """
     Write the bookmark in the state corresponding to the stream.
+    For monthly analytics streams, set the bookmark to the beginning of the month being evaluated (start of the window).
     """
+    monthly_granularity_streams = [
+        'ad_analytics_by_member_company_size',
+        'ad_analytics_by_member_industry',
+        'ad_analytics_by_member_seniority',
+        'ad_analytics_by_member_job_title',
+        'ad_analytics_by_member_job_function',
+        'ad_analytics_by_member_country_v2',
+        'ad_analytics_by_member_region_v2',
+        'ad_analytics_by_member_company',
+        'ad_analytics_by_placement_name'
+    ]
+
+    if stream_name in monthly_granularity_streams:
+        try:
+            if isinstance(value, int):
+                dt_value = datetime.fromtimestamp(value / 1000)
+            else:
+                dt_value = parse(value)
+            # Subtract one month, set to first of that month
+            prev_month = (dt_value.replace(day=1) - relativedelta(months=1))
+            prev_month = prev_month.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            if isinstance(value, int):
+                value = int(prev_month.timestamp() * 1000)
+            else:
+                value = prev_month.strftime('%Y-%m-%d %H:%M:%S')
+        except Exception as e:
+            LOGGER.warning("Could not adjust bookmark for stream '%s'. Using original value. Error: %s", stream_name, e)
+
     if 'bookmarks' not in state:
         state['bookmarks'] = {}
     state['bookmarks'][stream_name] = value
