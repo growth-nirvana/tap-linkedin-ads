@@ -57,8 +57,12 @@ def convert_json(this_json):
 # convert string/currency number to decimal
 def string_to_decimal(val):
     try:
-        new_val = Decimal(sub(r'[^\d.]', '', val))
-        return new_val
+        # First clean the string to preserve minus signs and 'E' for scientific notation
+        cleaned_val = sub(r'[^\d.\-E]', '', val)
+        # Convert to Decimal first to handle scientific notation properly
+        decimal_val = Decimal(cleaned_val)
+        # Convert to float for BigQuery compatibility and JSON serialization
+        return float(decimal_val)
     except Exception:
         return None
 
@@ -107,7 +111,7 @@ def transform_analytics(data_dict):
                 year = data_dict['date_range']['end']['year']
                 month = data_dict['date_range']['end']['month']
                 day = data_dict['date_range']['end']['day']
-                end_at = datetime(year=year, month=month, day=day) + timedelta(days=1)
+                end_at = datetime(year=year, month=month, day=day)
                 data_dict['end_at'] = end_at.strftime('%Y-%m-%dT%H:%M:%SZ')
     return data_dict
 
