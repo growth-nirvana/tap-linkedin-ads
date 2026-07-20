@@ -164,14 +164,22 @@ def shift_sync_window(params, today, date_window_size, forced_window_size=None):
                   'dateRange.end.year': new_end.year,}
     return current_end, new_end, new_params
 
-def merge_responses(pivot, data, client=None, stream_name=None):
+def merge_responses(pivot, data, client=None, stream_name=None, parent_id=None):
     """
     Prepare map with key as primary key and value as the record itself for analytics streams.
     The primary key is a combination of pivotValue and start date fields value.
     Update existing records with the same primary key value.
+
+    When ``parent_id`` is supplied (the sponsored campaign id from the parent
+    ``campaigns`` sync), each element is tagged with its campaign URN so the
+    downstream URN -> _id transforms produce ``campaign`` / ``campaign_id`` for
+    the demographic and firmographic pivots (which do not carry the campaign in
+    the API response itself).
     """
     full_records = {}
     urns_to_resolve = set()
+
+    campaign_urn = 'urn:li:sponsoredCampaign:{}'.format(parent_id) if parent_id else None
     
     # Define resolution configs for different streams
     resolution_configs = {
@@ -217,6 +225,11 @@ def merge_responses(pivot, data, client=None, stream_name=None):
             # adding pivot and pivot_value to make it compatible with the previous tap version
             element['pivot'] = pivot
             element["pivot_value"] = temp_pivotValue
+            # Demographic/firmographic pivots (MEMBER_*) do not include the
+            # campaign in the API response. Stamp the parent campaign URN so
+            # `transform_urn` derives `campaign_id` (matching the schema).
+            if campaign_urn and 'campaign' not in element:
+                element['campaign'] = campaign_urn
 
             # Collect URNs for resolution
             if client and stream_name in resolution_configs:
@@ -655,7 +668,7 @@ class LinkedInAds:
                     if page.get(self.data_key):
                         responses.append(page.get(self.data_key))
             pivot = params["pivot"] if "pivot" in params.keys() else None
-            raw_records = merge_responses(pivot, responses, client, self.tap_stream_id)
+            raw_records = merge_responses(pivot, responses, client, self.tap_stream_id, parent_id)
             time_extracted = utils.now()
 
             # While we broke the ad_analytics streams out from
