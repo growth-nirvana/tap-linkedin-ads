@@ -158,8 +158,10 @@ class TestStreamsUtils(unittest.TestCase):
     def test_shift_sync_window(self, name, today_month, today_date):
         """
         Test that `shift_sync_window` function move date window properly.
+        The next window starts the day after the previous end, because the
+        API's dateRange includes its end date.
         """
-        expected_start_date = datetime.date(year=2020, month=10, day=1)
+        expected_start_date = datetime.date(year=2020, month=10, day=2)
         expected_end_date = datetime.date(year=2020, month=10, day=31)
         expected_params = {
             'dateRange.start.year': expected_start_date.year,
@@ -184,6 +186,24 @@ class TestStreamsUtils(unittest.TestCase):
         self.assertEqual(expected_start_date, actual_start_date)
         self.assertEqual(expected_end_date, actual_end_date)
         self.assertEqual(expected_params, actual_params)
+
+    def test_shift_sync_window_after_last_window(self):
+        """
+        Test that shifting a window that already ends on today returns a start
+        after the end, so the sync loop stops without another request.
+        """
+        today = datetime.date(year=2020, month=10, day=31)
+        params = {
+            'dateRange.end.year': 2020,
+            'dateRange.end.month': 10,
+            'dateRange.end.day': 31,
+        }
+
+        actual_start_date, actual_end_date, _ = shift_sync_window(params, today, 30)
+
+        self.assertEqual(actual_start_date, datetime.date(year=2020, month=11, day=1))
+        self.assertEqual(actual_end_date, today)
+        self.assertGreater(actual_start_date, actual_end_date)
 
     def test_merge_responses_no_overlap(self):
         """
@@ -343,7 +363,8 @@ class TestLinkedInAds(unittest.TestCase):
         ['test_multiple_record', 1, '2022-08-01T00:00:00Z', {'elements': [{'id': 1}]}]
     ])
     @mock.patch("tap_linkedin_ads.streams.LinkedInAds.process_records")
-    @mock.patch("tap_linkedin_ads.streams.shift_sync_window", return_value=('', '', ''))
+    @mock.patch("tap_linkedin_ads.streams.shift_sync_window",
+                return_value=(datetime.date.max, datetime.date.min, {}))
     @mock.patch("tap_linkedin_ads.streams.transform_json")
     @mock.patch("tap_linkedin_ads.streams.sync_analytics_endpoint")
     @mock.patch("tap_linkedin_ads.streams.merge_responses")
@@ -353,7 +374,7 @@ class TestLinkedInAds(unittest.TestCase):
         Test that `sync_ad_analytics` function work properly for zero records as well as multiple records.
         """
 
-        client = LinkedinClient('client_id', 'client_secret', 'refresh_token', 'access_token', 'config_path')
+        client = mock.Mock()
         bookmark='2022-08-01T00:00:00Z'
         date_window_size = 7
 
@@ -387,3 +408,98 @@ class TestLinkedInAds(unittest.TestCase):
             ACCOUNT_OBJ.write_record([], '')
 
         mock_logger.assert_called_with('record: %s', [])
+
+
+class FakeDate(datetime.date):
+    """datetime.date with a fixed today()."""
+    fixed_today = None
+
+    @classmethod
+    def today(cls):
+        return cls.fixed_today
+
+
+class TestAdAnalyticsDateWindows(unittest.TestCase):
+    """
+    The adAnalytics dateRange includes its end date. Consecutive windows must
+    not share a day, must together cover every day from the start to today
+    exactly once, and the loop must stop without an extra request.
+    """
+
+    def run_windows(self, bookmark, today, date_window_size):
+        """Run sync_ad_analytics with the API mocked; return the requested windows in order."""
+        FakeDate.fixed_today = today
+        requests = []
+
+        def fake_endpoint(client, stream_name, path, query_string):
+            params = dict(pair.split('=', 1) for pair in query_string.split('&'))
+            start = datetime.date(int(params['dateRange.start.year']),
+                                  int(params['dateRange.start.month']),
+                                  int(params['dateRange.start.day']))
+            end = datetime.date(int(params['dateRange.end.year']),
+                                int(params['dateRange.end.month']),
+                                int(params['dateRange.end.day']))
+            requests.append((start, end))
+            return iter([])
+
+        fake_datetime = mock.Mock(date=FakeDate)
+        with mock.patch('tap_linkedin_ads.streams.datetime', fake_datetime), \
+                mock.patch('tap_linkedin_ads.streams.sync_analytics_endpoint', side_effect=fake_endpoint):
+            AD_ANALYTICS_BY_CAMPAIGN.sync_ad_analytics(mock.Mock(), CATALOG, bookmark, date_window_size)
+
+        # One request per field chunk per window: collapse consecutive repeats into windows.
+        windows = []
+        for window in requests:
+            if not windows or windows[-1] != window:
+                windows.append(window)
+        self.assertEqual(len(requests) % len(windows), 0)
+        self.assertEqual(len(set(windows)), len(windows), 'a window was requested twice')
+        return windows
+
+    def assert_windows_cover_once(self, windows, first_day, today):
+        for start, end in windows:
+            self.assertLessEqual(start, end)
+            self.assertLessEqual(end, today)
+        for (_, prev_end), (next_start, _) in zip(windows, windows[1:]):
+            self.assertEqual(next_start, prev_end + datetime.timedelta(days=1))
+        days = []
+        for start, end in windows:
+            day = start
+            while day <= end:
+                days.append(day)
+                day += datetime.timedelta(days=1)
+        expected = [first_day + datetime.timedelta(days=i) for i in range((today - first_day).days + 1)]
+        self.assertEqual(days, expected)
+
+    @parameterized.expand([
+        # name, bookmark, today, window size, expected windows
+        ['several_windows', '2026-01-08T00:00:00Z', datetime.date(2026, 3, 15), 30,
+         [(datetime.date(2026, 1, 1), datetime.date(2026, 1, 31)),
+          (datetime.date(2026, 2, 1), datetime.date(2026, 3, 2)),
+          (datetime.date(2026, 3, 3), datetime.date(2026, 3, 15))]],
+        ['last_window_ends_on_today', '2026-01-08T00:00:00Z', datetime.date(2026, 3, 2), 30,
+         [(datetime.date(2026, 1, 1), datetime.date(2026, 1, 31)),
+          (datetime.date(2026, 2, 1), datetime.date(2026, 3, 2))]],
+        ['first_window_ends_on_today', '2026-01-08T00:00:00Z', datetime.date(2026, 1, 31), 30,
+         [(datetime.date(2026, 1, 1), datetime.date(2026, 1, 31))]],
+        ['one_day_windows', '2026-01-08T00:00:00Z', datetime.date(2026, 1, 5), 1,
+         [(datetime.date(2026, 1, 1), datetime.date(2026, 1, 2)),
+          (datetime.date(2026, 1, 3), datetime.date(2026, 1, 3)),
+          (datetime.date(2026, 1, 4), datetime.date(2026, 1, 4)),
+          (datetime.date(2026, 1, 5), datetime.date(2026, 1, 5))]],
+    ])
+    def test_windows_do_not_overlap(self, name, bookmark, today, date_window_size, expected):
+        windows = self.run_windows(bookmark, today, date_window_size)
+        self.assertEqual(windows, expected)
+        self.assert_windows_cover_once(windows, expected[0][0], today)
+
+    @parameterized.expand([
+        # Bookmark minus the 7-day lookback lands exactly on today.
+        ['start_is_today', '2026-03-22T00:00:00Z'],
+        # Start would be in the future; it is clamped to today.
+        ['start_after_today', '2026-04-30T00:00:00Z'],
+    ])
+    def test_single_day_first_window_requested_once(self, name, bookmark):
+        today = datetime.date(2026, 3, 15)
+        windows = self.run_windows(bookmark, today, 30)
+        self.assertEqual(windows, [(today, today)])

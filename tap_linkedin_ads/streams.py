@@ -146,6 +146,13 @@ def get_next_url(stream_name, next_url, data):
 def shift_sync_window(params, today, date_window_size, forced_window_size=None):
     """
     Move ahead date window by date_window_size and update params with the new date window.
+
+    LinkedIn's adAnalytics `dateRange` includes its end date, so the next window
+    starts the day after the current window's end. Starting on the end date would
+    request (and emit) the boundary day twice.
+
+    Once the current window already ends on `today`, the returned start is after
+    the returned end; callers stop on `start > end`.
     """
     current_end = datetime.date(
         year=params['dateRange.end.year'],
@@ -153,16 +160,17 @@ def shift_sync_window(params, today, date_window_size, forced_window_size=None):
         day=params['dateRange.end.day'],
     )
 
+    new_start = current_end + timedelta(days=1)
     new_end = min(today, current_end + timedelta(days=(forced_window_size if forced_window_size else date_window_size)))
 
     new_params = {**params,
-                  'dateRange.start.day': current_end.day,
-                  'dateRange.start.month': current_end.month,
-                  'dateRange.start.year': current_end.year,
+                  'dateRange.start.day': new_start.day,
+                  'dateRange.start.month': new_start.month,
+                  'dateRange.start.year': new_start.year,
                   'dateRange.end.day': new_end.day,
                   'dateRange.end.month': new_end.month,
                   'dateRange.end.year': new_end.year,}
-    return current_end, new_end, new_params
+    return new_start, new_end, new_params
 
 def merge_responses(pivot, data, client=None, stream_name=None, parent_id=None):
     """
@@ -698,7 +706,8 @@ class LinkedInAds:
 
             window_start_date, window_end_date, static_params = shift_sync_window(static_params, today, date_window_size)
 
-            if window_start_date == window_end_date:
+            # The window just synced ended on today: nothing is left to request.
+            if window_start_date > window_end_date:
                 break
 
         return total_records, max_bookmark_value
