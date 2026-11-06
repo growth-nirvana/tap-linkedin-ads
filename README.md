@@ -176,6 +176,11 @@ To generate the **access_token**:
 }
 ```
 
+Analytics streams are only requested for campaigns with activity in the sync window: one
+account-level call per run lists them, and campaigns without rows are skipped. Set
+`"sync_inactive_campaigns": true` to request every campaign. If the listing fails or comes
+back empty, every campaign is requested.
+
 ## Quick Start
 
 1. Install

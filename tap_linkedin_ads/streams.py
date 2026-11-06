@@ -113,6 +113,52 @@ def sync_analytics_endpoint(client, stream_name, path, query_string):
         LOGGER.info('%s: Synced page %s', stream_name, page)
         page = page + 1
 
+def active_campaign_ids(client, account_id, window_start, today):
+    """
+    Ids of the account's campaigns with any analytics rows from window_start to today.
+
+    One account-level adAnalytics call (pivot CAMPAIGN, granularity ALL). LinkedIn only
+    returns rows for campaigns that have data, so a campaign missing here has nothing
+    for any analytics stream in the window and its per-campaign calls can be skipped.
+    Returns None when the call fails; the caller then syncs every campaign, as it
+    also does when the answer is empty.
+    """
+    params = {
+        'q': 'analytics',
+        'pivot': 'CAMPAIGN',
+        'timeGranularity': 'ALL',
+        'accounts[0]': 'urn:li:sponsoredAccount:{}'.format(account_id),
+        'dateRange.start.day': window_start.day,
+        'dateRange.start.month': window_start.month,
+        'dateRange.start.year': window_start.year,
+        'dateRange.end.day': today.day,
+        'dateRange.end.month': today.month,
+        'dateRange.end.year': today.year,
+        'fields': 'pivotValues,impressions,clicks,costInLocalCurrency',
+        'count': 10000,
+    }
+    query_string = '&'.join(['%s=%s' % (key, value) for (key, value) in params.items()])
+    try:
+        active = set()
+        for page in sync_analytics_endpoint(client, 'active_campaigns', 'adAnalytics', query_string):
+            for element in page.get('elements') or []:
+                for urn in element.get('pivotValues') or []:
+                    campaign_id = urn.split(':')[-1]
+                    if campaign_id.isdigit():
+                        active.add(int(campaign_id))
+        return active
+    except Exception as err:  # pylint: disable=broad-except
+        LOGGER.warning('Could not list active campaigns for account %s (%s); syncing every campaign', account_id, err)
+        return None
+
+
+def analytics_window_start(child_bookmarks, start_date):
+    """The earliest day any analytics child will request (its bookmark minus 7 days)."""
+    bookmarks = [value for name, value in child_bookmarks.items() if name in ANALYTICS_STREAMS and value]
+    earliest = min((strptime_to_utc(value) for value in bookmarks), default=strptime_to_utc(start_date))
+    return (earliest - timedelta(days=7)).date()
+
+
 def get_next_url(stream_name, next_url, data):
     """
     Prepare and return the URL to fetch the next page of records.
@@ -406,9 +452,13 @@ class LinkedInAds:
                       selected_streams,
                       date_window_size,
                       parent_id=None,
-                      account_list=None):
+                      account_list=None,
+                      skip_inactive_campaigns=False):
         """
         Sync a specific parent or child endpoint.
+
+        With skip_inactive_campaigns, analytics children are only requested for the
+        campaigns active in their window (see active_campaign_ids).
         """
         # Get the latest bookmark for the stream and set the last_datetime
         last_datetime = self.get_bookmark(state, start_date)
@@ -472,7 +522,19 @@ class LinkedInAds:
                 url = '{}/{}?{}'.format(BASE_URL, self.path, querystring)
             urllist.append((None, url))
 
+        analytics_children = [c for c in children if c in selected_streams and c in ANALYTICS_STREAMS]
         for acct_id, next_url in urllist:
+            active_campaigns = None
+            if skip_inactive_campaigns and self.tap_stream_id == 'campaigns' and analytics_children and acct_id:
+                window_start = analytics_window_start(child_max_bookmarks, start_date)
+                active_campaigns = active_campaign_ids(client, acct_id, window_start, datetime.date.today())
+                if not active_campaigns:
+                    # Nothing listed: sync every campaign rather than trust an empty answer.
+                    active_campaigns = None
+                if active_campaigns is not None:
+                    LOGGER.info('Account %s: %s campaigns active since %s; analytics only for those',
+                                acct_id, len(active_campaigns), window_start)
+            skipped = 0
             while next_url: #pylint: disable=too-many-nested-blocks
                 LOGGER.info('URL for %s: %s', self.tap_stream_id, next_url)
 
@@ -520,6 +582,10 @@ class LinkedInAds:
                         for record in pre_singer_transformed_data:
 
                             parent_id = record.get(child_obj.foreign_key)
+                            if (active_campaigns is not None and child_stream_name in ANALYTICS_STREAMS
+                                    and str(parent_id).isdigit() and int(parent_id) not in active_campaigns):
+                                skipped += 1
+                                continue
 
                             child_stream_params = child_obj.params
                             # Add children filter params based on parent IDs
@@ -584,6 +650,9 @@ class LinkedInAds:
                                 record_count,
                                 total_records)
                 page = page + 1
+
+            if active_campaigns is not None:
+                LOGGER.info('Account %s: skipped %s analytics requests for inactive campaigns', acct_id, skipped)
 
         # Write child stream's bookmarks
         for key, val in list(child_max_bookmarks.items()):
