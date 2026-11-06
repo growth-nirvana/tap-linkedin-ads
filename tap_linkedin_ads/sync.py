@@ -134,7 +134,8 @@ def sync(client, config, catalog, state):
             start_date=start_date,
             selected_streams=selected_streams,
             date_window_size=date_window_size,
-            account_list=account_list)
+            account_list=account_list,
+            skip_inactive_campaigns=not config.get('sync_inactive_campaigns', False))
 
         # Write parent stream's bookmarks
         if stream_obj.replication_keys and stream_name in selected_streams:

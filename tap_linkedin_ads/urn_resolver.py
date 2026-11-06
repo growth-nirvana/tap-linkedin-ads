@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, Set, Optional, Any
+from typing import Dict, Set, Optional, Any, Tuple
 
 LOGGER = logging.getLogger(__name__)
 
@@ -349,6 +349,11 @@ class URNResolverFactory:
             
         return resolver_class(client, locale)
 
+# Names resolved so far in this run, per (endpoint, locale). Each analytics call used to
+# build a fresh resolver, so the same titles/companies were looked up once per campaign.
+_RESOLVED: Dict[Tuple[str, Optional[str]], Dict[str, str]] = {}
+
+
 def resolve_urns(client: Any, urns: Set[str], endpoint: str, locale: Optional[str] = None) -> Dict[str, str]:
     """
     Resolve URNs to their names using the appropriate resolver.
@@ -362,5 +367,13 @@ def resolve_urns(client: Any, urns: Set[str], endpoint: str, locale: Optional[st
     Returns:
         Dictionary mapping codes to resolved names
     """
-    resolver = URNResolverFactory.create_resolver(endpoint, client, locale)
-    return resolver.resolve(urns) 
+    cache = _RESOLVED.setdefault((endpoint, locale), {})
+    codes = {urn.split(':')[-1] for urn in urns}
+    missing = {urn for urn in urns if urn.split(':')[-1] not in cache}
+    if missing:
+        resolver = URNResolverFactory.create_resolver(endpoint, client, locale)
+        for code, name in resolver.resolve(missing).items():
+            # A failed lookup falls back to the code itself; leave it out so it is retried.
+            if name and name != code:
+                cache[code] = name
+    return {code: cache.get(code, code) for code in codes}
