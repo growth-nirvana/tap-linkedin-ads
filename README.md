@@ -181,6 +181,17 @@ account-level call per run lists them, and campaigns without rows are skipped. S
 `"sync_inactive_campaigns": true` to request every campaign. If the listing fails or comes
 back empty, every campaign is requested.
 
+The demographic and firmographic streams (`ad_analytics_by_member_*`) are requested once per
+account, not once per campaign: an adAnalytics `statistics` call pivoted by `CAMPAIGN` and the
+member value covers every campaign, and each row keeps its `campaign_id`. Records, keys and
+bookmarks are the same as the per-campaign calls gave. If an answer is full (10,000 rows) the
+window is fetched again per campaign. Set `"member_pivots_by_account": false` to go back to
+per-campaign calls.
+
+These calls run up to `"max_concurrency"` at a time (default 4, at most 8). A 429 from LinkedIn
+pauses every request until LinkedIn's `Retry-After` (or 2, 4, 8 ... up to 60 seconds) has passed.
+Records are written in the same order whatever order the calls finish in.
+
 ## Quick Start
 
 1. Install

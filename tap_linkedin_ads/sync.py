@@ -1,5 +1,5 @@
 import singer
-from tap_linkedin_ads.streams import STREAMS, write_bookmark
+from tap_linkedin_ads.streams import STREAMS, write_bookmark, normalize_max_concurrency
 
 LOGGER = singer.get_logger()
 
@@ -80,6 +80,13 @@ def sync(client, config, catalog, state):
         date_window_size = DATE_WINDOW_SIZE
         LOGGER.info('Using standard date window size of %s', DATE_WINDOW_SIZE)
 
+    # MEMBER_* streams: one account-wide call per window instead of one per campaign
+    # (set member_pivots_by_account to false to go back to per-campaign calls), with up
+    # to max_concurrency analytics calls at once.
+    member_pivots_by_account = str(config.get('member_pivots_by_account', True)).lower() not in ('false', '0', 'no', '')
+    max_concurrency = normalize_max_concurrency(config.get('max_concurrency'))
+    LOGGER.info('member_pivots_by_account: %s, max_concurrency: %s', member_pivots_by_account, max_concurrency)
+
     # Get ALL selected streams from catalog
     selected_streams = []
     for stream in catalog.get_selected_streams(state):
@@ -135,7 +142,9 @@ def sync(client, config, catalog, state):
             selected_streams=selected_streams,
             date_window_size=date_window_size,
             account_list=account_list,
-            skip_inactive_campaigns=not config.get('sync_inactive_campaigns', False))
+            skip_inactive_campaigns=not config.get('sync_inactive_campaigns', False),
+            member_pivots_by_account=member_pivots_by_account,
+            max_concurrency=max_concurrency)
 
         # Write parent stream's bookmarks
         if stream_obj.replication_keys and stream_name in selected_streams:

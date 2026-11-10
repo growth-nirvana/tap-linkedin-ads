@@ -3,6 +3,7 @@ import re
 import copy
 import datetime
 from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
 import singer
 from singer import metrics, metadata, utils
 from singer import Transformer, should_sync_field, UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING
@@ -53,6 +54,34 @@ ANALYTICS_STREAMS = [
     "ad_analytics_by_member_company",
     "ad_analytics_by_placement_name"
 ]
+
+# Demographic and firmographic streams. With `member_pivots_by_account` (the default)
+# these are pulled with one adAnalytics `statistics` call per account, pivoted by
+# CAMPAIGN and the MEMBER_* value, instead of one `analytics` call per campaign.
+MEMBER_PIVOT_STREAMS = [
+    "ad_analytics_by_member_company_size",
+    "ad_analytics_by_member_industry",
+    "ad_analytics_by_member_seniority",
+    "ad_analytics_by_member_job_title",
+    "ad_analytics_by_member_job_function",
+    "ad_analytics_by_member_country_v2",
+    "ad_analytics_by_member_region_v2",
+    "ad_analytics_by_member_company",
+]
+
+# adAnalytics answers are not paged and LinkedIn caps them (15,000 rows); the tap also
+# asks for count=10000. A page that comes back this full may be cut short, so the
+# account-wide call for that window is redone one campaign at a time (the old path).
+ANALYTICS_ROW_LIMIT = 10000
+
+DEFAULT_MAX_CONCURRENCY = 4
+MAX_CONCURRENCY_LIMIT = 8
+
+# LinkedIn has a max of 20 fields per request. We cap the chunks at 18
+# to make sure there's always room for us to append `dateRange`, and `pivotValues`
+MAX_CHUNK_LENGTH = 18
+
+CAMPAIGN_URN_PREFIX = 'urn:li:sponsoredCampaign:'
 
 CURSOR_BASED_PAGINATION_STREAMS = ["accounts", "campaign_groups", "campaigns", "creatives"]
 NEW_PATH_STREAMS = ["campaign_groups", "campaigns", "creatives"]
@@ -218,6 +247,43 @@ def shift_sync_window(params, today, date_window_size, forced_window_size=None):
                   'dateRange.end.year': new_end.year,}
     return new_start, new_end, new_params
 
+# Name lookups for the pivot values of each stream
+RESOLUTION_CONFIGS = {
+    "ad_analytics_by_member_country_v2": {
+        "endpoint": "geo",
+        "locale": "(language:en,country:US)"
+    },
+    "ad_analytics_by_member_region_v2": {
+        "endpoint": "geo",
+        "locale": "(language:en,country:US)"
+    },
+    "ad_analytics_by_member_job_function": {
+        "endpoint": "functions",
+        "name_path": ['name', 'localized', 'en_US'],
+        "locale": "en_US"
+    },
+    "ad_analytics_by_member_job_title": {
+        "endpoint": "titles",
+        "name_path": ['name', 'localized', 'en_US'],
+        "locale": "en_US"
+    },
+    "ad_analytics_by_member_industry": {
+        "endpoint": "industries",
+        "name_path": ['name', 'localized', 'en_US'],
+        "locale": "(language:en,country:US)"
+    },
+    "ad_analytics_by_member_company": {
+        "endpoint": "organizations",
+        "name_path": ['name', 'localized', 'en_US']
+    },
+    "ad_analytics_by_member_seniority": {
+        "endpoint": "seniorities",
+        "name_path": ["name", "localized", "en_US"],
+        "locale": None
+    },
+}
+
+
 def merge_responses(pivot, data, client=None, stream_name=None, parent_id=None):
     """
     Prepare map with key as primary key and value as the record itself for analytics streams.
@@ -234,43 +300,7 @@ def merge_responses(pivot, data, client=None, stream_name=None, parent_id=None):
     urns_to_resolve = set()
 
     campaign_urn = 'urn:li:sponsoredCampaign:{}'.format(parent_id) if parent_id else None
-    
-    # Define resolution configs for different streams
-    resolution_configs = {
-        "ad_analytics_by_member_country_v2": {
-            "endpoint": "geo",
-            "locale": "(language:en,country:US)"
-        },
-        "ad_analytics_by_member_region_v2": {
-            "endpoint": "geo",
-            "locale": "(language:en,country:US)"
-        },
-        "ad_analytics_by_member_job_function": {
-            "endpoint": "functions",
-            "name_path": ['name', 'localized', 'en_US'],
-            "locale": "en_US"
-        },
-        "ad_analytics_by_member_job_title": {
-            "endpoint": "titles",
-            "name_path": ['name', 'localized', 'en_US'],
-            "locale": "en_US"
-        },
-        "ad_analytics_by_member_industry": {
-            "endpoint": "industries",
-            "name_path": ['name', 'localized', 'en_US'],
-            "locale": "(language:en,country:US)"
-        },
-        "ad_analytics_by_member_company": {
-            "endpoint": "organizations",
-            "name_path": ['name', 'localized', 'en_US']
-        },
-        "ad_analytics_by_member_seniority": {
-            "endpoint": "seniorities",
-            "name_path": ["name", "localized", "en_US"],
-            "locale": None
-        },
-    }
-    
+
     for page in data:
         # Loop through each record of the page
         for element in page:
@@ -286,7 +316,7 @@ def merge_responses(pivot, data, client=None, stream_name=None, parent_id=None):
                 element['campaign'] = campaign_urn
 
             # Collect URNs for resolution
-            if client and stream_name in resolution_configs:
+            if client and stream_name in RESOLUTION_CONFIGS:
                 urns_to_resolve.add(temp_pivotValue)
 
             string_start = '{}-{}-{}'.format(temp_start['year'], temp_start['month'], temp_start['day'])
@@ -298,21 +328,318 @@ def merge_responses(pivot, data, client=None, stream_name=None, parent_id=None):
                 full_records[primary_key] = element
 
     # Resolve names if needed
-    if client and stream_name in resolution_configs:
-        config = resolution_configs[stream_name]
-        resolved_names = batch_resolve_urns(
-            client, 
-            urns_to_resolve, 
-            config["endpoint"],
-            config.get("name_path"),
-            config.get("locale")
-        )
-        # Update records with resolved names
-        for record in full_records.values():
-            code = record["pivot_value"].split(':')[-1]
-            record["pivot_value_name"] = resolved_names.get(code, code)
+    if client and stream_name in RESOLUTION_CONFIGS:
+        resolve_pivot_value_names(client, stream_name, urns_to_resolve, full_records.values())
 
     return full_records
+
+
+def resolve_pivot_value_names(client, stream_name, urns_to_resolve, records):
+    """Set `pivot_value_name` on each record from the stream's name lookup."""
+    config = RESOLUTION_CONFIGS[stream_name]
+    resolved_names = batch_resolve_urns(
+        client,
+        urns_to_resolve,
+        config["endpoint"],
+        config.get("name_path"),
+        config.get("locale")
+    )
+    # Update records with resolved names
+    for record in records:
+        code = record["pivot_value"].split(':')[-1]
+        record["pivot_value_name"] = resolved_names.get(code, code)
+
+def analytics_field_chunks(catalog, stream_name):
+    """
+    The `fields` lists for one analytics window: a first call for just `dateRange` and
+    `pivotValues`, then the selected metrics in groups of MAX_CHUNK_LENGTH, each with
+    `dateRange` and `pivotValues` added so the answers can be merged on them.
+    """
+    # Here, valid_selected_fields is a list of fields that the user has selected.
+    # API accepts these fields in the parameter and returns its value in the response.
+    valid_selected_fields = [snake_case_to_camel_case(field)
+                             for field in selected_fields(catalog.get_stream(stream_name))
+                             if snake_case_to_camel_case(field) not in FIELDS_UNAVAILABLE_FOR_AD_ANALYTICS]
+
+    # When testing the API, if the fields in `field` all return `0` then
+    # the API returns its empty response.
+
+    # However, the API distinguishes between a day with non-null values
+    # (even if this means the values are all `0`) and a day with null
+    # values. We found that requesting these fields gives you the days with
+    # non-null values
+    first_chunk = [['dateRange', 'pivotValues']]
+
+    chunks = first_chunk + list(split_into_chunks(valid_selected_fields, MAX_CHUNK_LENGTH))
+
+    # We have to append these fields in order to ensure we get them back
+    # so that we can create the composite primary key for the record and
+    # to merge the multiple responses based on this primary key
+    for chunk in chunks:
+        for field in ['dateRange', 'pivotValues']:
+            if field not in chunk:
+                chunk.append(field)
+    return chunks
+
+
+def analytics_windows(last_datetime, date_window_size, today):
+    """
+    The (start, end) date ranges `sync_ad_analytics` requests, in order: from 7 days
+    before the bookmark to today, the first window date_window_size + 1 days long and
+    the rest date_window_size days (both ends are included by LinkedIn).
+    """
+    window_start = (strptime_to_utc(last_datetime) - timedelta(days=7)).date()
+    window_end = min(window_start + timedelta(days=date_window_size), today)
+    window_start = min(window_start, today, window_end)
+    windows = []
+    while window_end <= today:
+        windows.append((window_start, window_end))
+        if window_end >= today:
+            break
+        window_start = window_end + timedelta(days=1)
+        window_end = min(today, window_end + timedelta(days=date_window_size))
+    return windows
+
+
+def normalize_max_concurrency(value):
+    """`max_concurrency` from the config as an int from 1 to MAX_CONCURRENCY_LIMIT."""
+    if value in (None, ''):
+        return DEFAULT_MAX_CONCURRENCY
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        LOGGER.warning('Invalid max_concurrency %r; using %s', value, DEFAULT_MAX_CONCURRENCY)
+        return DEFAULT_MAX_CONCURRENCY
+    if value > MAX_CONCURRENCY_LIMIT:
+        LOGGER.warning('max_concurrency %s is above %s; using %s', value, MAX_CONCURRENCY_LIMIT, MAX_CONCURRENCY_LIMIT)
+    return max(1, min(value, MAX_CONCURRENCY_LIMIT))
+
+
+def run_ordered(func, items, max_concurrency):
+    """
+    Yield func(item) for each item, in the order of `items`, running up to
+    max_concurrency calls at once. Results are handed back in input order whatever
+    order the calls finish in, so everything downstream (records, bookmarks) stays
+    deterministic. The first error is raised and the calls not yet started are dropped.
+    """
+    items = list(items)
+    if max_concurrency <= 1 or len(items) <= 1:
+        for item in items:
+            yield func(item)
+        return
+    with ThreadPoolExecutor(max_workers=max_concurrency, thread_name_prefix='linkedin-analytics') as pool:
+        futures = [pool.submit(func, item) for item in items]
+        try:
+            for future in futures:
+                yield future.result()
+        finally:
+            for future in futures:
+                future.cancel()
+
+
+def campaign_id_of(urn):
+    """The numeric id of a sponsoredCampaign URN, else None."""
+    if isinstance(urn, str) and urn.startswith(CAMPAIGN_URN_PREFIX):
+        campaign_id = urn[len(CAMPAIGN_URN_PREFIX):]
+        if campaign_id.isdigit():
+            return int(campaign_id)
+    return None
+
+
+def member_pivot_params(stream_name, account_id, window, fields, campaign_id=None):
+    """
+    adAnalytics `statistics` query for one MEMBER_* stream, account and window,
+    pivoted by CAMPAIGN and the stream's member pivot (Rest.li 1.0 query syntax, as
+    the tap's other adAnalytics calls). `campaign_id` narrows it to one campaign.
+    """
+    stream_params = STREAMS[stream_name].params
+    window_start, window_end = window
+    params = {
+        'q': 'statistics',
+        'pivots[0]': 'CAMPAIGN',
+        'pivots[1]': stream_params['pivot'],
+        'timeGranularity': stream_params['timeGranularity'],
+        'accounts[0]': 'urn:li:sponsoredAccount:{}'.format(account_id),
+    }
+    if campaign_id is not None:
+        params['campaigns[0]'] = '{}{}'.format(CAMPAIGN_URN_PREFIX, campaign_id)
+    params.update({
+        'dateRange.start.day': window_start.day,
+        'dateRange.start.month': window_start.month,
+        'dateRange.start.year': window_start.year,
+        'dateRange.end.day': window_end.day,
+        'dateRange.end.month': window_end.month,
+        'dateRange.end.year': window_end.year,
+        'fields': ','.join(fields),
+        'start': 0,
+        'count': stream_params.get('count', ANALYTICS_ROW_LIMIT),
+    })
+    return params
+
+
+def fetch_analytics_rows(client, stream_name, params):
+    """
+    All rows of one adAnalytics query, following `next` links if LinkedIn sends any.
+    Returns (rows, maybe_truncated): a page holding ANALYTICS_ROW_LIMIT rows or more
+    with no next link may have been cut short by LinkedIn.
+    """
+    query_string = '&'.join(['%s=%s' % (key, value) for (key, value) in params.items()])
+    rows = []
+    maybe_truncated = False
+    for page in sync_analytics_endpoint(client, stream_name, 'adAnalytics', query_string):
+        elements = page.get('elements') or []
+        rows.extend(elements)
+        if len(elements) >= ANALYTICS_ROW_LIMIT and not get_next_url(stream_name, '', page):
+            maybe_truncated = True
+    return rows, maybe_truncated
+
+
+def fetch_member_window(client, stream_name, account_id, window, chunks, campaign_ids):
+    """
+    Every field chunk of one MEMBER_* stream for one account and window, as a list of
+    row lists (one per chunk, in chunk order) for merge_account_responses.
+
+    One account-wide call per chunk covers all campaigns. If any chunk may have hit
+    LinkedIn's row cap, the window is fetched again one campaign at a time instead.
+    (Splitting the date range would change the MONTHLY rows' start dates; splitting by
+    campaign gives the same rows the per-campaign path did.)
+    """
+    responses = []
+    for chunk in chunks:
+        rows, maybe_truncated = fetch_analytics_rows(
+            client, stream_name, member_pivot_params(stream_name, account_id, window, chunk))
+        if maybe_truncated:
+            LOGGER.warning('%s: account %s, %s to %s reached %s rows; fetching it per campaign',
+                           stream_name, account_id, window[0], window[1], ANALYTICS_ROW_LIMIT)
+            return fetch_member_window_per_campaign(client, stream_name, account_id, window, chunks, campaign_ids)
+        responses.append(rows)
+    return responses
+
+
+def fetch_member_window_per_campaign(client, stream_name, account_id, window, chunks, campaign_ids):
+    """The fallback of fetch_member_window: the same query once per campaign."""
+    responses = []
+    for campaign_id in campaign_ids:
+        for chunk in chunks:
+            rows, maybe_truncated = fetch_analytics_rows(
+                client, stream_name,
+                member_pivot_params(stream_name, account_id, window, chunk, campaign_id=campaign_id))
+            if maybe_truncated:
+                LOGGER.warning('%s: campaign %s, %s to %s reached %s rows; LinkedIn may have dropped some',
+                               stream_name, campaign_id, window[0], window[1], ANALYTICS_ROW_LIMIT)
+            responses.append(rows)
+    return responses
+
+
+def merge_account_responses(pivot, data, client, stream_name, campaign_ids):
+    """
+    merge_responses for the account-wide MEMBER_* calls, whose rows carry
+    pivotValues [campaign URN, member URN].
+
+    Each row is reshaped to what the per-campaign call returned: `pivotValues` holds
+    just the member URN, `pivot` / `pivot_value` are the member pivot, and `campaign`
+    is the campaign URN (so `campaign_id` is filled). Rows are merged on
+    (campaign, member value, start date). Only campaigns listed by the campaigns
+    stream are kept, as the per-campaign path only asked for those.
+
+    Returns the records in a fixed order: campaign (in campaign_ids order), then
+    start date, then member value.
+    """
+    order = {campaign_id: index for index, campaign_id in enumerate(campaign_ids)}
+    full_records = {}
+    urns_to_resolve = set()
+    dropped = 0
+
+    for page in data:
+        for element in page:
+            pivot_values = element.get('pivotValues') or []
+            campaign_urn = next((v for v in pivot_values if campaign_id_of(v) is not None), None)
+            member_values = [v for v in pivot_values if v != campaign_urn]
+            campaign_id = campaign_id_of(campaign_urn)
+            if campaign_id not in order or not member_values:
+                dropped += 1
+                continue
+            member_value = member_values[0]
+            element['pivotValues'] = [member_value]
+            element['pivot'] = pivot
+            element['pivot_value'] = member_value
+            if 'campaign' not in element:
+                element['campaign'] = campaign_urn
+
+            if client and stream_name in RESOLUTION_CONFIGS:
+                urns_to_resolve.add(member_value)
+
+            temp_start = element['dateRange']['start']
+            start_key = (temp_start['year'], temp_start['month'], temp_start['day'])
+            primary_key = (order[campaign_id], start_key, member_value)
+            if primary_key in full_records:
+                full_records[primary_key].update(element)
+            else:
+                full_records[primary_key] = element
+
+    if dropped:
+        LOGGER.info('%s: skipped %s rows for campaigns the campaigns stream did not list', stream_name, dropped)
+
+    records = [full_records[key] for key in sorted(full_records)]
+    if client and stream_name in RESOLUTION_CONFIGS:
+        resolve_pivot_value_names(client, stream_name, urns_to_resolve, records)
+    return records
+
+
+def sync_member_analytics_by_account(client, catalog, state, start_date, stream_names,
+                                     account_id, campaign_ids, date_window_size,
+                                     max_concurrency=DEFAULT_MAX_CONCURRENCY):
+    """
+    Sync the MEMBER_* streams for one account with account-wide calls.
+
+    Every (stream, window) is fetched on a pool of up to max_concurrency threads; the
+    results are taken back in stream then window order, and the records are written
+    from this thread only, so output order does not depend on which call finishes
+    first. Returns {stream_name: (records written, max bookmark)}; the caller writes
+    the bookmarks once every account is done, as for the per-campaign streams.
+    """
+    today = datetime.date.today()
+    plans = []
+    for stream_name in stream_names:
+        stream_obj = STREAMS[stream_name]()
+        last_datetime = stream_obj.get_bookmark(state, start_date)
+        chunks = analytics_field_chunks(catalog, stream_name)
+        for window in analytics_windows(last_datetime, date_window_size, today):
+            plans.append((stream_obj, last_datetime, chunks, window))
+
+    LOGGER.info('Account %s: %s member-pivot windows for %s campaigns, %s at a time',
+                account_id, len(plans), len(campaign_ids), max_concurrency)
+
+    def fetch(plan):
+        stream_obj, _, chunks, window = plan
+        return fetch_member_window(client, stream_obj.tap_stream_id, account_id, window, chunks, campaign_ids)
+
+    results = {}
+    for plan, responses in zip(plans, run_ordered(fetch, plans, max_concurrency)):
+        stream_obj, last_datetime, _, window = plan
+        stream_name = stream_obj.tap_stream_id
+        total_records, max_bookmark_value = results.get(stream_name, (0, last_datetime))
+
+        records = merge_account_responses(stream_obj.params['pivot'], responses, client, stream_name, campaign_ids)
+        time_extracted = utils.now()
+        transformed_data = transform_json({stream_obj.data_key: records}, stream_name)[stream_obj.data_key]
+        if transformed_data:
+            last_datetime_dt = strptime_to_utc(last_datetime) - timedelta(days=7)
+            window_bookmark, record_count = stream_obj.process_records(
+                catalog=catalog,
+                records=transformed_data,
+                time_extracted=time_extracted,
+                bookmark_field=next(iter(stream_obj.replication_keys)),
+                max_bookmark_value=last_datetime,
+                last_datetime=strftime(last_datetime_dt))
+            if strptime_to_utc(window_bookmark) > strptime_to_utc(max_bookmark_value):
+                max_bookmark_value = window_bookmark
+            total_records += record_count
+            LOGGER.info('%s: account %s, %s to %s: %s records', stream_name, account_id,
+                        window[0], window[1], record_count)
+        results[stream_name] = (total_records, max_bookmark_value)
+    return results
+
 
 class LinkedInAds:
     """
@@ -453,12 +780,18 @@ class LinkedInAds:
                       date_window_size,
                       parent_id=None,
                       account_list=None,
-                      skip_inactive_campaigns=False):
+                      skip_inactive_campaigns=False,
+                      member_pivots_by_account=False,
+                      max_concurrency=1):
         """
         Sync a specific parent or child endpoint.
 
         With skip_inactive_campaigns, analytics children are only requested for the
         campaigns active in their window (see active_campaign_ids).
+
+        With member_pivots_by_account, the MEMBER_* analytics children of `campaigns`
+        are synced with account-wide calls once the account's campaigns are listed
+        (see sync_member_analytics_by_account), up to max_concurrency calls at once.
         """
         # Get the latest bookmark for the stream and set the last_datetime
         last_datetime = self.get_bookmark(state, start_date)
@@ -522,8 +855,13 @@ class LinkedInAds:
                 url = '{}/{}?{}'.format(BASE_URL, self.path, querystring)
             urllist.append((None, url))
 
-        analytics_children = [c for c in children if c in selected_streams and c in ANALYTICS_STREAMS]
+        account_level_children = []
+        if member_pivots_by_account and self.tap_stream_id == 'campaigns':
+            account_level_children = [c for c in children if c in selected_streams and c in MEMBER_PIVOT_STREAMS]
+        analytics_children = [c for c in children if c in selected_streams and c in ANALYTICS_STREAMS
+                              and c not in account_level_children]
         for acct_id, next_url in urllist:
+            account_campaign_ids = []
             active_campaigns = None
             if skip_inactive_campaigns and self.tap_stream_id == 'campaigns' and analytics_children and acct_id:
                 window_start = analytics_window_start(child_max_bookmarks, start_date)
@@ -560,6 +898,10 @@ class LinkedInAds:
                     break # No data results
 
                 pre_singer_transformed_data = copy.deepcopy(transformed_data)
+                if account_level_children:
+                    account_campaign_ids.extend(
+                        record.get('id') for record in pre_singer_transformed_data
+                        if record.get('id') is not None)
                 if self.tap_stream_id in selected_streams:
                     # Process records and gets the max_bookmark_value and record_count for the set of records
                     max_bookmark_value, record_count = self.process_records(
@@ -575,7 +917,7 @@ class LinkedInAds:
 
                 # Loop thru parent batch records for each children objects
                 for child_stream_name in children:
-                    if child_stream_name in selected_streams:
+                    if child_stream_name in selected_streams and child_stream_name not in account_level_children:
                         # For each parent record
                         child_obj = STREAMS[child_stream_name]()
 
@@ -654,6 +996,24 @@ class LinkedInAds:
             if active_campaigns is not None:
                 LOGGER.info('Account %s: skipped %s analytics requests for inactive campaigns', acct_id, skipped)
 
+            if account_level_children and account_campaign_ids:
+                account_results = sync_member_analytics_by_account(
+                    client=client,
+                    catalog=catalog,
+                    state=state,
+                    start_date=start_date,
+                    stream_names=account_level_children,
+                    account_id=acct_id,
+                    campaign_ids=account_campaign_ids,
+                    date_window_size=date_window_size,
+                    max_concurrency=max_concurrency)
+                for child_stream_name, (child_total_records, child_batch_bookmark_value) in account_results.items():
+                    child_batch_bookmark_dttm = strptime_to_utc(child_batch_bookmark_value)
+                    if child_batch_bookmark_dttm > strptime_to_utc(child_max_bookmarks.get(child_stream_name)):
+                        child_max_bookmarks[child_stream_name] = strftime(child_batch_bookmark_dttm)
+                    LOGGER.info('Synced: %s, account: %s, total_records: %s',
+                                child_stream_name, acct_id, child_total_records)
+
         # Write child stream's bookmarks
         for key, val in list(child_max_bookmarks.items()):
             write_bookmark(state, val, key)
@@ -665,10 +1025,6 @@ class LinkedInAds:
         """
         Sync method for ad_analytics_by_campaign, ad_analytics_by_creative
         """
-        # LinkedIn has a max of 20 fields per request. We cap the chunks at 18
-        # to make sure there's always room for us to append `dateRange`, and `pivotValues`
-        MAX_CHUNK_LENGTH = 18
-
         bookmark_field = next(iter(self.replication_keys))
 
         max_bookmark_value = last_datetime
@@ -698,30 +1054,7 @@ class LinkedInAds:
                          'dateRange.end.month': window_end_date.month,
                          'dateRange.end.year': window_end_date.year,}
 
-        # Here, valid_selected_fields is a list of fields that the user has selected.
-        # API accepts these fields in the parameter and returns its value in the response.
-        valid_selected_fields = [snake_case_to_camel_case(field)
-                                 for field in selected_fields(catalog.get_stream(self.tap_stream_id))
-                                 if snake_case_to_camel_case(field) not in FIELDS_UNAVAILABLE_FOR_AD_ANALYTICS]
-
-        # When testing the API, if the fields in `field` all return `0` then
-        # the API returns its empty response.
-
-        # However, the API distinguishes between a day with non-null values
-        # (even if this means the values are all `0`) and a day with null
-        # values. We found that requesting these fields gives you the days with
-        # non-null values
-        first_chunk = [['dateRange', 'pivotValues']]
-
-        chunks = first_chunk + list(split_into_chunks(valid_selected_fields, MAX_CHUNK_LENGTH))
-
-        # We have to append these fields in order to ensure we get them back
-        # so that we can create the composite primary key for the record and
-        # to merge the multiple responses based on this primary key
-        for chunk in chunks:
-            for field in ['dateRange', 'pivotValues']:
-                if field not in chunk:
-                    chunk.append(field)
+        chunks = analytics_field_chunks(catalog, self.tap_stream_id)
 
         ############### PAGINATION (for these 2 streams) ###############
         # The Tap requests LinkedIn with one Campaign ID at one time.
