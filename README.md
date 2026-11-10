@@ -182,15 +182,21 @@ account-level call per run lists them, and campaigns without rows are skipped. S
 back empty, every campaign is requested.
 
 The demographic and firmographic streams (`ad_analytics_by_member_*`) are requested once per
-account, not once per campaign: an adAnalytics `statistics` call pivoted by `CAMPAIGN` and the
-member value covers every campaign, and each row keeps its `campaign_id`. Records, keys and
-bookmarks are the same as the per-campaign calls gave. If an answer is full (10,000 rows) the
-window is fetched again per campaign. Set `"member_pivots_by_account": false` to go back to
-per-campaign calls.
+campaign (`q=analytics`, `pivot=MEMBER_*`), so each row keeps its `campaign_id`. LinkedIn's
+`statistics` finder, the only one taking two pivots, does not accept any `MEMBER_*` pivot
+([Statistics Finder Query Parameters](https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting-schema)),
+so the account-wide `CAMPAIGN` + member call v1.4.0 made gets HTTP 400 ("is not an enum
+symbol"). `"member_pivots_by_account"` (default true) only applies to a stream whose pivot that
+finder accepts; today none of these streams qualifies.
 
-These calls run up to `"max_concurrency"` at a time (default 4, at most 8). A 429 from LinkedIn
-pauses every request until LinkedIn's `Retry-After` (or 2, 4, 8 ... up to 60 seconds) has passed.
-Records are written in the same order whatever order the calls finish in.
+The account-wide calls run up to `"max_concurrency"` at a time (default 4, at most 8). A 429 from
+LinkedIn pauses every request until LinkedIn's `Retry-After` (or 2, 4, 8 ... up to 60 seconds) has
+passed. Records are written in the same order whatever order the calls finish in.
+
+If LinkedIn rejects one stream's request (HTTP 400, 403 or 404), that stream is skipped for the
+rest of the run, its bookmark is left where it was, and every other stream carries on. Once they
+are done the tap logs `CRITICAL Streams failed: <stream>, ...` (then one line per stream with its
+error) and exits 1. Sign-in, rate limit and server errors still stop the run.
 
 ## Quick Start
 

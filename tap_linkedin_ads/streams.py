@@ -10,6 +10,7 @@ from singer import Transformer, should_sync_field, UNIX_MILLISECONDS_INTEGER_DAT
 from singer.utils import strptime_to_utc, strftime
 from tap_linkedin_ads.transform import transform_json, snake_case_to_camel_case
 from tap_linkedin_ads.urn_resolver import resolve_urns
+from tap_linkedin_ads.client import LinkedInBadRequestError, LinkedInForbiddenError, LinkedInNotFoundError
 import json
 
 LOGGER = singer.get_logger()
@@ -55,9 +56,11 @@ ANALYTICS_STREAMS = [
     "ad_analytics_by_placement_name"
 ]
 
-# Demographic and firmographic streams. With `member_pivots_by_account` (the default)
-# these are pulled with one adAnalytics `statistics` call per account, pivoted by
-# CAMPAIGN and the MEMBER_* value, instead of one `analytics` call per campaign.
+# Demographic and firmographic streams. `member_pivots_by_account` would pull these with
+# one adAnalytics `statistics` call per account, pivoted by CAMPAIGN and the MEMBER_*
+# value, but only for a stream whose pivot LinkedIn's statistics finder accepts (see
+# STATISTICS_PIVOTS). None of the MEMBER_* pivots is accepted, so every one of these
+# streams takes one `analytics` call per campaign.
 MEMBER_PIVOT_STREAMS = [
     "ad_analytics_by_member_company_size",
     "ad_analytics_by_member_industry",
@@ -68,6 +71,55 @@ MEMBER_PIVOT_STREAMS = [
     "ad_analytics_by_member_region_v2",
     "ad_analytics_by_member_company",
 ]
+
+# The pivots LinkedIn's statistics finder (q=statistics, the only finder taking more than
+# one pivot) accepts, from "Statistics Finder Query Parameters" in
+# https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting-schema
+# (versions 202511 to 202610). The MEMBER_* demographic pivots are listed only for the
+# analytics finder (one pivot per call); asking statistics for one gets HTTP 400
+# '"MEMBER_COMPANY_SIZE" is not an enum symbol'. So a demographic row can only be tied to
+# its campaign by asking one campaign at a time.
+STATISTICS_PIVOTS = frozenset([
+    'COMPANY', 'ACCOUNT', 'SHARE', 'CAMPAIGN', 'CREATIVE', 'CAMPAIGN_GROUP', 'CONVERSION',
+    'CONVERSATION_NODE', 'CONVERSATION_NODE_OPTION_INDEX', 'SERVING_LOCATION', 'OBJECTIVE_TYPE',
+    'CARD_INDEX', 'PLACEMENT_NAME', 'IMPRESSION_DEVICE_TYPE', 'EVENT_STAGE',
+])
+
+# API errors that are about one stream's request (a bad parameter, no access to that
+# report). One of these ends that stream only; the others keep syncing and the tap exits
+# non-zero at the end (StreamSyncErrors). Sign-in, rate limit and server errors still stop
+# the run, as every stream would hit them.
+STREAM_ERRORS = (LinkedInBadRequestError, LinkedInForbiddenError, LinkedInNotFoundError)
+
+
+class StreamSyncErrors(Exception):
+    """Raised once every other stream is done when one or more streams failed.
+
+    The first line names the failed streams (`Streams failed: a, b`); one line per stream
+    follows with its error.
+    """
+
+    def __init__(self, failed_streams):
+        self.failed_streams = dict(failed_streams)
+        lines = ['Streams failed: {}'.format(', '.join(sorted(self.failed_streams)))]
+        lines += ['{}: {}'.format(name, self.failed_streams[name]) for name in sorted(self.failed_streams)]
+        super().__init__('\n'.join(lines))
+
+
+def record_stream_failure(failed_streams, stream_name, error):
+    """Note that stream_name failed (the first error is kept) and log it."""
+    if failed_streams is None or stream_name in failed_streams:
+        return
+    failed_streams[stream_name] = str(error) or error.__class__.__name__
+    LOGGER.error('%s failed; skipping the rest of this stream and syncing the others: %s',
+                 stream_name, failed_streams[stream_name])
+
+
+def pivots_by_account(stream_name):
+    """True when stream_name can be pulled with one account-wide statistics call."""
+    return (stream_name in MEMBER_PIVOT_STREAMS
+            and STREAMS[stream_name].params.get('pivot') in STATISTICS_PIVOTS)
+
 
 # adAnalytics answers are not paged and LinkedIn caps them (15,000 rows); the tap also
 # asks for count=10000. A page that comes back this full may be cut short, so the
@@ -782,17 +834,26 @@ class LinkedInAds:
                       account_list=None,
                       skip_inactive_campaigns=False,
                       member_pivots_by_account=False,
-                      max_concurrency=1):
+                      max_concurrency=1,
+                      failed_streams=None):
         """
         Sync a specific parent or child endpoint.
+
+        A child stream whose request LinkedIn rejects (STREAM_ERRORS) is noted in
+        failed_streams and skipped from then on; its bookmark is left as it was. The
+        parent and its other children carry on.
 
         With skip_inactive_campaigns, analytics children are only requested for the
         campaigns active in their window (see active_campaign_ids).
 
         With member_pivots_by_account, the MEMBER_* analytics children of `campaigns`
         are synced with account-wide calls once the account's campaigns are listed
-        (see sync_member_analytics_by_account), up to max_concurrency calls at once.
+        (see sync_member_analytics_by_account), up to max_concurrency calls at once. Only
+        streams whose pivot the statistics finder accepts go that way (pivots_by_account):
+        none of the MEMBER_* ones do, so they take the per-campaign calls.
         """
+        if failed_streams is None:
+            failed_streams = {}
         # Get the latest bookmark for the stream and set the last_datetime
         last_datetime = self.get_bookmark(state, start_date)
         max_bookmark_value = last_datetime
@@ -857,7 +918,7 @@ class LinkedInAds:
 
         account_level_children = []
         if member_pivots_by_account and self.tap_stream_id == 'campaigns':
-            account_level_children = [c for c in children if c in selected_streams and c in MEMBER_PIVOT_STREAMS]
+            account_level_children = [c for c in children if c in selected_streams and pivots_by_account(c)]
         analytics_children = [c for c in children if c in selected_streams and c in ANALYTICS_STREAMS
                               and c not in account_level_children]
         for acct_id, next_url in urllist:
@@ -917,7 +978,8 @@ class LinkedInAds:
 
                 # Loop thru parent batch records for each children objects
                 for child_stream_name in children:
-                    if child_stream_name in selected_streams and child_stream_name not in account_level_children:
+                    if (child_stream_name in selected_streams and child_stream_name not in account_level_children
+                            and child_stream_name not in failed_streams):
                         # For each parent record
                         child_obj = STREAMS[child_stream_name]()
 
@@ -950,24 +1012,29 @@ class LinkedInAds:
                                         parent_id)
 
                             # Call sync method for the child stream
-                            if child_stream_name in ANALYTICS_STREAMS:
-                                child_total_records, child_batch_bookmark_value = child_obj.sync_ad_analytics(
-                                    client=client,
-                                    catalog=catalog,
-                                    last_datetime=child_obj.get_bookmark(state, start_date),
-                                    date_window_size=date_window_size,
-                                    parent_id=parent_id)
-                            else:
-                                child_total_records, child_batch_bookmark_value = child_obj.sync_endpoint(
-                                    client=client,
-                                    catalog=catalog,
-                                    state=state,
-                                    page_size=page_size,
-                                    start_date=start_date,
-                                    selected_streams=selected_streams,
-                                    date_window_size=date_window_size,
-                                    parent_id=parent_id,
-                                    account_list=[acct_id])
+                            try:
+                                if child_stream_name in ANALYTICS_STREAMS:
+                                    child_total_records, child_batch_bookmark_value = child_obj.sync_ad_analytics(
+                                        client=client,
+                                        catalog=catalog,
+                                        last_datetime=child_obj.get_bookmark(state, start_date),
+                                        date_window_size=date_window_size,
+                                        parent_id=parent_id)
+                                else:
+                                    child_total_records, child_batch_bookmark_value = child_obj.sync_endpoint(
+                                        client=client,
+                                        catalog=catalog,
+                                        state=state,
+                                        page_size=page_size,
+                                        start_date=start_date,
+                                        selected_streams=selected_streams,
+                                        date_window_size=date_window_size,
+                                        parent_id=parent_id,
+                                        account_list=[acct_id],
+                                        failed_streams=failed_streams)
+                            except STREAM_ERRORS as error:
+                                record_stream_failure(failed_streams, child_stream_name, error)
+                                break
 
                             child_batch_bookmark_dttm = strptime_to_utc(child_batch_bookmark_value)
                             child_max_bookmark = child_max_bookmarks.get(child_stream_name)
@@ -996,17 +1063,25 @@ class LinkedInAds:
             if active_campaigns is not None:
                 LOGGER.info('Account %s: skipped %s analytics requests for inactive campaigns', acct_id, skipped)
 
-            if account_level_children and account_campaign_ids:
-                account_results = sync_member_analytics_by_account(
-                    client=client,
-                    catalog=catalog,
-                    state=state,
-                    start_date=start_date,
-                    stream_names=account_level_children,
-                    account_id=acct_id,
-                    campaign_ids=account_campaign_ids,
-                    date_window_size=date_window_size,
-                    max_concurrency=max_concurrency)
+            pending_account_children = [c for c in account_level_children if c not in failed_streams]
+            if pending_account_children and account_campaign_ids:
+                try:
+                    account_results = sync_member_analytics_by_account(
+                        client=client,
+                        catalog=catalog,
+                        state=state,
+                        start_date=start_date,
+                        stream_names=pending_account_children,
+                        account_id=acct_id,
+                        campaign_ids=account_campaign_ids,
+                        date_window_size=date_window_size,
+                        max_concurrency=max_concurrency)
+                except STREAM_ERRORS as error:
+                    # The streams of one account are fetched together: the error is
+                    # charged to each of them.
+                    for child_stream_name in pending_account_children:
+                        record_stream_failure(failed_streams, child_stream_name, error)
+                    account_results = {}
                 for child_stream_name, (child_total_records, child_batch_bookmark_value) in account_results.items():
                     child_batch_bookmark_dttm = strptime_to_utc(child_batch_bookmark_value)
                     if child_batch_bookmark_dttm > strptime_to_utc(child_max_bookmarks.get(child_stream_name)):
@@ -1014,9 +1089,11 @@ class LinkedInAds:
                     LOGGER.info('Synced: %s, account: %s, total_records: %s',
                                 child_stream_name, acct_id, child_total_records)
 
-        # Write child stream's bookmarks
+        # Write child stream's bookmarks (not for a child that failed: it starts from the
+        # same place next run)
         for key, val in list(child_max_bookmarks.items()):
-            write_bookmark(state, val, key)
+            if key not in failed_streams:
+                write_bookmark(state, val, key)
 
         return total_records, max_bookmark_value
 

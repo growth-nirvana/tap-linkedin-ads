@@ -1,6 +1,10 @@
 """
-MEMBER_* (demographic / firmographic) streams pulled with one account-wide call per
-window instead of one call per campaign, with concurrent requests.
+MEMBER_* (demographic / firmographic) streams, and the account-wide path
+(member_pivots_by_account) with concurrent requests.
+
+LinkedIn's statistics finder does not accept the MEMBER_* pivots (STATISTICS_PIVOTS), so
+those streams take one call per campaign. The account-wide machinery is still tested
+here (AccountPathTestCase) as if LinkedIn accepted them.
 
 Everything runs against a synthetic in-memory LinkedIn API: no network, no tokens.
 """
@@ -17,7 +21,7 @@ from unittest import mock
 from singer import metadata
 
 from tap_linkedin_ads import streams
-from tap_linkedin_ads.client import LinkedinClient, RateLimitGate
+from tap_linkedin_ads.client import LinkedinClient, LinkedInBadRequestError, RateLimitGate
 from tap_linkedin_ads.discover import discover
 
 MEMBER_STREAMS = streams.MEMBER_PIVOT_STREAMS
@@ -66,8 +70,13 @@ class FakeLinkedIn:
     requested range, only the requested fields, pivotValues in pivot order.
     """
 
-    def __init__(self, today, schema_types, row_limit=None, delay=None):
+    def __init__(self, today, schema_types, row_limit=None, delay=None, failing_pivots=()):
         self.today = today
+        # What LinkedIn's statistics finder accepts as of this fake's creation (a test may
+        # patch STATISTICS_PIVOTS afterwards to force the account-wide path).
+        self.statistics_pivots = set(streams.STATISTICS_PIVOTS)
+        # Pivots whose analytics calls get a 400 (as if LinkedIn rejected that report).
+        self.failing_pivots = set(failing_pivots)
         self.schema_types = schema_types
         self.row_limit = row_limit
         self.delay = delay
@@ -113,12 +122,21 @@ class FakeLinkedIn:
         else:
             assert params['q'] == 'statistics'
             pivots = [params['pivots[0]'], params['pivots[1]']]
+            for index, pivot in enumerate(pivots):
+                if pivot not in self.statistics_pivots:
+                    # What LinkedIn answers (run 19b8b6fe, tap v1.4.0)
+                    raise LinkedInBadRequestError(
+                        "HTTP-error-code: 400, Error: {{'inputErrors': [{{'description': "
+                        "'ERROR :: /value :: \"{}\" is not an enum symbol', 'input': {{'inputPath': "
+                        "{{'fieldPath': 'pivots_{}/value'}}}}, 'code': 'FIELD_INVALID'}}]}}".format(pivot, index))
             account_id = int(params['accounts[0]'].split(':')[-1])
             if 'campaigns[0]' in params:
                 campaign_ids = [int(params['campaigns[0]'].split(':')[-1])]
             else:
                 campaign_ids = sorted(c for c in list(ACCOUNTS[account_id]) + list(UNLISTED)
                                       if self.campaign_account(c) == account_id)
+        if set(pivots) & self.failing_pivots:
+            raise LinkedInBadRequestError('HTTP-error-code: 400, Error: rejected {}'.format(pivots))
         assert params['timeGranularity'] == 'MONTHLY'
         fields = params['fields'].split(',')
         assert len(fields) <= 20
@@ -224,6 +242,18 @@ class MemberPivotTestCase(unittest.TestCase):
         return FakeLinkedIn(self.today, self.types, **kwargs)
 
 
+class AccountPathTestCase(MemberPivotTestCase):
+    """The account-wide path, as if LinkedIn's statistics finder took the MEMBER_* pivots."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(
+            streams, 'STATISTICS_PIVOTS',
+            streams.STATISTICS_PIVOTS | {streams.STREAMS[name].params['pivot'] for name in MEMBER_STREAMS})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
 class TestPivotToCampaignMapping(MemberPivotTestCase):
     def test_rows_get_campaign_and_member_like_the_per_campaign_call(self):
         rows = [[
@@ -293,7 +323,7 @@ class TestPivotToCampaignMapping(MemberPivotTestCase):
             self.assertEqual(streams.analytics_windows(last, size, today), requested, (days_back, size))
 
 
-class TestParityWithPerCampaignPath(MemberPivotTestCase):
+class TestParityWithPerCampaignPath(AccountPathTestCase):
     def test_identical_records_and_bookmarks(self):
         old_fake = self.fake()
         old = run_campaigns_sync(old_fake, self.catalog, {}, self.start_date, member_pivots_by_account=False)
@@ -337,7 +367,7 @@ class TestParityWithPerCampaignPath(MemberPivotTestCase):
         self.assertTrue(any('campaigns[0]=' in url and 'q=statistics' in url for url in capped_fake.urls))
 
 
-class TestConcurrencyOrdering(MemberPivotTestCase):
+class TestConcurrencyOrdering(AccountPathTestCase):
     def test_same_output_order_whatever_order_calls_finish_in(self):
         serial = run_campaigns_sync(self.fake(), self.catalog, {}, self.start_date,
                                     member_pivots_by_account=True, max_concurrency=1)
@@ -450,7 +480,7 @@ class FakeSession:
         pass
 
 
-class TestRateLimitBackoffUnderConcurrency(MemberPivotTestCase):
+class TestRateLimitBackoffUnderConcurrency(AccountPathTestCase):
     def test_a_429_pauses_every_worker_and_the_call_is_retried(self):
         expected = run_campaigns_sync(self.fake(), self.catalog, {}, self.start_date,
                                       member_pivots_by_account=True, max_concurrency=1)
@@ -513,6 +543,139 @@ class TestRateLimitBackoffUnderConcurrency(MemberPivotTestCase):
         for _ in range(10):
             gate.trip()
         self.assertEqual(gate.trip(), RateLimitGate.MAX_PAUSE)
+
+
+
+class TestMemberPivotsTakePerCampaignCalls(MemberPivotTestCase):
+    """LinkedIn's statistics finder rejects every MEMBER_* pivot (tap v1.4.0, run 19b8b6fe)."""
+
+    def test_no_member_pivot_is_a_statistics_pivot(self):
+        for name in MEMBER_STREAMS:
+            self.assertNotIn(streams.STREAMS[name].params['pivot'], streams.STATISTICS_PIVOTS, name)
+            self.assertFalse(streams.pivots_by_account(name), name)
+        self.assertIn('CAMPAIGN', streams.STATISTICS_PIVOTS)
+        self.assertIn('PLACEMENT_NAME', streams.STATISTICS_PIVOTS)
+
+    def test_the_v140_request_gets_linkedins_400(self):
+        params = streams.member_pivot_params(
+            'ad_analytics_by_member_company_size', '1001',
+            (datetime.date(2026, 9, 1), datetime.date(2026, 9, 30)), ['dateRange', 'pivotValues'])
+        url = 'https://api.linkedin.com/rest/adAnalytics?' + '&'.join(
+            '{}={}'.format(k, v) for k, v in params.items())
+        with self.assertRaises(LinkedInBadRequestError) as caught:
+            self.fake().get(url)
+        self.assertIn('"MEMBER_COMPANY_SIZE" is not an enum symbol', str(caught.exception))
+
+    def test_default_setting_makes_per_campaign_analytics_calls(self):
+        fake = self.fake()
+        got = run_campaigns_sync(fake, self.catalog, {}, self.start_date, member_pivots_by_account=True,
+                                 max_concurrency=4)
+        expected = run_campaigns_sync(self.fake(), self.catalog, {}, self.start_date,
+                                      member_pivots_by_account=False)
+        analytics = [url for url in fake.urls if '/adAnalytics?' in url]
+        self.assertTrue(analytics)
+        self.assertFalse([url for url in analytics if 'q=statistics' in url])
+        self.assertTrue(all('q=analytics' in url and 'campaigns[0]=' in url for url in analytics))
+        self.assertEqual(got.records, expected.records)
+        self.assertEqual(got.states, expected.states)
+        for name in MEMBER_STREAMS:
+            self.assertTrue(got.records[name], name)
+
+
+class TestOneStreamErrorDoesNotStopTheOthers(MemberPivotTestCase):
+    def test_a_rejected_child_stream_is_skipped_and_the_others_finish(self):
+        expected = run_campaigns_sync(self.fake(), self.catalog, {}, self.start_date,
+                                      member_pivots_by_account=True)
+        fake = self.fake(failing_pivots={'MEMBER_COMPANY_SIZE'})
+        failed = {}
+        capture = Capture()
+        with mock.patch('singer.write_record', side_effect=capture.write_record), \
+                mock.patch('singer.write_schema'), \
+                mock.patch('singer.write_state', side_effect=capture.write_state), \
+                mock.patch.object(streams, 'batch_resolve_urns', side_effect=fake_names):
+            streams.Campaigns().sync_endpoint(
+                client=fake, catalog=self.catalog, state={}, page_size=100, start_date=self.start_date,
+                selected_streams=list(MEMBER_STREAMS), date_window_size=30,
+                account_list=[str(a) for a in ACCOUNTS], skip_inactive_campaigns=False,
+                member_pivots_by_account=True, max_concurrency=4, failed_streams=failed)
+
+        failing = 'ad_analytics_by_member_company_size'
+        self.assertEqual(list(failed), [failing])
+        self.assertIn('rejected', failed[failing])
+        self.assertNotIn(failing, capture.records)
+        self.assertNotIn(failing, capture.states[-1]['bookmarks'])  # starts over next run
+        for name in MEMBER_STREAMS:
+            if name != failing:
+                self.assertEqual(capture.records[name], expected.records[name], name)
+                self.assertEqual(capture.states[-1]['bookmarks'][name], expected.states[-1]['bookmarks'][name])
+        # after the first 400 the failed stream is not asked again, for any campaign
+        self.assertEqual(sum('MEMBER_COMPANY_SIZE' in url for url in fake.urls), 1)
+
+    def test_sync_finishes_every_other_stream_then_exits_non_zero(self):
+        """The v1.4.0 failure: the account-wide call for company size gets LinkedIn's 400."""
+        from tap_linkedin_ads.sync import sync
+        names = ['campaigns', 'ad_analytics_by_member_company_size', 'ad_analytics_by_member_industry']
+        catalog = selected_catalog(names)
+        fake = self.fake()  # accepts only the real statistics pivots
+        capture = Capture()
+        config = {'start_date': self.start_date, 'accounts': ','.join(str(a) for a in ACCOUNTS),
+                  'sync_inactive_campaigns': True}
+        state = {}
+        # Force company size onto the account-wide path, as v1.4.0 did.
+        forced = streams.STATISTICS_PIVOTS | {'MEMBER_COMPANY_SIZE'}
+        with mock.patch.object(streams, 'STATISTICS_PIVOTS', forced), \
+                mock.patch('singer.write_record', side_effect=capture.write_record), \
+                mock.patch('singer.write_schema'), \
+                mock.patch('singer.write_state', side_effect=capture.write_state), \
+                mock.patch.object(streams, 'batch_resolve_urns', side_effect=fake_names):
+            with self.assertRaises(streams.StreamSyncErrors) as caught:
+                sync(fake, config, catalog, state)
+
+        message = str(caught.exception)
+        self.assertEqual(message.splitlines()[0], 'Streams failed: ad_analytics_by_member_company_size')
+        self.assertIn('is not an enum symbol', message)
+        self.assertEqual(sorted(capture.records), ['ad_analytics_by_member_industry', 'campaigns'])
+        bookmarks = capture.states[-1]['bookmarks']
+        self.assertIn('ad_analytics_by_member_industry', bookmarks)
+        self.assertIn('campaigns', bookmarks)
+        self.assertNotIn('ad_analytics_by_member_company_size', bookmarks)
+        self.assertNotIn('currently_syncing', capture.states[-1])
+
+    def test_a_failed_parent_fails_its_children_and_the_next_stream_still_runs(self):
+        from tap_linkedin_ads import sync as sync_mod
+        catalog = selected_catalog(['accounts', 'campaigns', 'ad_analytics_by_campaign'])
+        calls = []
+
+        def campaigns_fail(self, **kwargs):
+            calls.append(self.tap_stream_id)
+            if self.tap_stream_id == 'campaigns':
+                raise LinkedInBadRequestError('HTTP-error-code: 400, Error: bad campaigns request')
+            return 1, '2026-01-01T00:00:00Z'
+
+        state = {}
+        with mock.patch.object(streams.LinkedInAds, 'sync_endpoint', campaigns_fail), \
+                mock.patch('singer.write_schema'), mock.patch('singer.write_state'):
+            with self.assertRaises(streams.StreamSyncErrors) as caught:
+                sync_mod.sync(object(), {'start_date': self.start_date, 'accounts': '1001'}, catalog, state)
+        self.assertEqual(caught.exception.failed_streams['campaigns'],
+                         'HTTP-error-code: 400, Error: bad campaigns request')
+        self.assertIn('parent stream campaigns failed',
+                      caught.exception.failed_streams['ad_analytics_by_campaign'])
+        self.assertIn('accounts', calls)
+        self.assertIn('accounts', state['bookmarks'])
+
+    def test_other_errors_still_stop_the_run(self):
+        from tap_linkedin_ads import sync as sync_mod
+        from tap_linkedin_ads.client import LinkedInUnauthorizedError
+        catalog = selected_catalog(['accounts', 'campaigns'])
+
+        def unauthorized(self, **kwargs):
+            raise LinkedInUnauthorizedError('HTTP-error-code: 401, Error: Expired access token')
+
+        with mock.patch.object(streams.LinkedInAds, 'sync_endpoint', unauthorized), \
+                mock.patch('singer.write_schema'), mock.patch('singer.write_state'):
+            with self.assertRaises(LinkedInUnauthorizedError):
+                sync_mod.sync(object(), {'start_date': self.start_date, 'accounts': '1001'}, catalog, {})
 
 
 if __name__ == '__main__':
