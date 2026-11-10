@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 import time
 import json
+import threading
 import backoff
 import requests
 
@@ -18,6 +19,58 @@ REQUEST_TIMEOUT = 300
 
 class LinkedInError(Exception):
     pass
+
+
+class RateLimitGate:
+    """
+    One pause shared by every thread that sends requests through a client.
+
+    When any request gets a 429, the gate closes for a while (LinkedIn's Retry-After,
+    else 2, 4, 8 ... up to 60 seconds for back-to-back 429s) and every worker waits for
+    it to reopen before its next request, instead of each one retrying on its own clock.
+    The per-request backoff in `LinkedinClient.request` still retries the call itself.
+    """
+    MAX_PAUSE = 60
+
+    def __init__(self, sleep=time.sleep, clock=time.monotonic):
+        self._sleep = sleep
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._resume_at = 0.0
+        self._strikes = 0
+
+    def wait(self):
+        """Block until the gate is open. Returns the seconds this caller waited."""
+        waited = 0.0
+        while True:
+            with self._lock:
+                delay = self._resume_at - self._clock()
+            if delay <= 0:
+                return waited
+            self._sleep(delay)
+            waited += delay
+
+    def trip(self, retry_after=None):
+        """Close the gate after a 429. Returns the pause in seconds."""
+        with self._lock:
+            self._strikes += 1
+            pause = retry_after if retry_after else min(self.MAX_PAUSE, 2 ** self._strikes)
+            self._resume_at = max(self._resume_at, self._clock() + pause)
+            return pause
+
+    def clear(self):
+        """A request went through: the next 429 starts the pause sequence again."""
+        with self._lock:
+            self._strikes = 0
+
+
+def retry_after_seconds(response):
+    """The Retry-After header as seconds, or None."""
+    try:
+        value = float(response.headers.get('Retry-After'))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return value if value > 0 else None
 
 class Server5xxError(LinkedInError):
     pass
@@ -141,6 +194,8 @@ class LinkedinClient: # pylint: disable=too-many-instance-attributes
         self.__expires = None
         self.__session = requests.Session()
         self.__base_url = None
+        # Shared by all threads that request through this client (see RateLimitGate).
+        self.rate_gate = RateLimitGate()
         # if request_timeout is other than 0,"0" or "" then use request_timeout
         if request_timeout and float(request_timeout):
             request_timeout = float(request_timeout)
@@ -376,9 +431,17 @@ class LinkedinClient: # pylint: disable=too-many-instance-attributes
             kwargs['headers']['Content-Type'] = 'application/x-www-form-urlencoded'
             kwargs['headers']['X-HTTP-Method-Override'] = 'GET'
 
+        # Wait out any 429 pause another thread hit before sending.
+        self.rate_gate.wait()
         with metrics.http_request_timer(endpoint) as timer:
             response = self.__session.request('POST', url, timeout=self.request_timeout, **kwargs)
             timer.tags[metrics.Tag.http_status_code] = response.status_code
+
+        if response.status_code == 429:
+            pause = self.rate_gate.trip(retry_after_seconds(response))
+            LOGGER.warning('429 from LinkedIn; pausing all requests for %.1fs', pause)
+        elif response.status_code == 200:
+            self.rate_gate.clear()
 
         if response.status_code != 200:
             raise_for_error(response)
