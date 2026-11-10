@@ -983,6 +983,13 @@ class LinkedInAds:
                         # For each parent record
                         child_obj = STREAMS[child_stream_name]()
 
+                        if self.tap_stream_id == 'campaigns' and child_stream_name in MEMBER_PIVOT_STREAMS:
+                            skipped += self.sync_member_analytics_per_campaign(
+                                client, catalog, state, start_date, date_window_size, child_obj,
+                                pre_singer_transformed_data, active_campaigns, child_max_bookmarks,
+                                failed_streams, max_concurrency)
+                            continue
+
                         for record in pre_singer_transformed_data:
 
                             parent_id = record.get(child_obj.foreign_key)
@@ -1097,14 +1104,77 @@ class LinkedInAds:
 
         return total_records, max_bookmark_value
 
+    # pylint: disable=too-many-arguments,too-many-locals
+    def sync_member_analytics_per_campaign(self, client, catalog, state, start_date, date_window_size,
+                                           child_obj, campaign_records, active_campaigns,
+                                           child_max_bookmarks, failed_streams, max_concurrency):
+        """
+        One MEMBER_* child of `campaigns` for one page of campaigns: one adAnalytics
+        `analytics` call per campaign, window and field chunk, as sync_ad_analytics makes.
+
+        The calls of up to max_concurrency campaigns run at once on worker threads
+        (fetch_ad_analytics, which writes nothing); the records are written from this
+        thread in campaign order (write_ad_analytics), so records and state are the same
+        as one campaign at a time, whatever order the calls finish in. A 429 pauses every
+        worker (the client's rate gate). A STREAM_ERRORS error ends this stream: the
+        campaigns before it are written, the rest are not asked.
+
+        Returns how many campaigns were skipped as inactive.
+        """
+        child_stream_name = child_obj.tap_stream_id
+        skipped = 0
+        campaign_ids = []
+        for record in campaign_records:
+            parent_id = record.get(child_obj.foreign_key)
+            if (active_campaigns is not None and str(parent_id).isdigit()
+                    and int(parent_id) not in active_campaigns):
+                skipped += 1
+                continue
+            campaign_ids.append(parent_id)
+
+        # Child bookmarks are only written once every account is done, so this is the
+        # same for every campaign.
+        child_last_datetime = child_obj.get_bookmark(state, start_date)
+        base_params = dict(child_obj.params)
+
+        def fetch(parent_id):
+            params = {**base_params, 'campaigns[0]': '{}{}'.format(CAMPAIGN_URN_PREFIX, parent_id)}
+            return child_obj.fetch_ad_analytics(client, catalog, child_last_datetime, date_window_size,
+                                                parent_id=parent_id, params=params)
+
+        try:
+            for parent_id, windows in zip(campaign_ids, run_ordered(fetch, campaign_ids, max_concurrency)):
+                LOGGER.info('Syncing: %s, parent_stream: %s, parent_id: %s',
+                            child_stream_name, self.tap_stream_id, parent_id)
+                child_total_records, child_batch_bookmark_value = child_obj.write_ad_analytics(
+                    client, catalog, child_last_datetime, windows, parent_id=parent_id)
+
+                child_batch_bookmark_dttm = strptime_to_utc(child_batch_bookmark_value)
+                if child_batch_bookmark_dttm > strptime_to_utc(child_max_bookmarks.get(child_stream_name)):
+                    child_max_bookmarks[child_stream_name] = strftime(child_batch_bookmark_dttm)
+
+                LOGGER.info('Synced: %s, parent_id: %s, total_records: %s',
+                            child_stream_name, parent_id, child_total_records)
+                LOGGER.info('FINISHED Syncing: %s', child_stream_name)
+        except STREAM_ERRORS as error:
+            record_stream_failure(failed_streams, child_stream_name, error)
+        return skipped
+
     # pylint: disable=too-many-branches,too-many-statements,unused-argument
     def sync_ad_analytics(self, client, catalog, last_datetime, date_window_size, parent_id=None):
         """
         Sync method for ad_analytics_by_campaign, ad_analytics_by_creative
         """
-        bookmark_field = next(iter(self.replication_keys))
+        windows = self.fetch_ad_analytics(client, catalog, last_datetime, date_window_size,
+                                          parent_id=parent_id, params=self.params)
+        return self.write_ad_analytics(client, catalog, last_datetime, windows, parent_id=parent_id)
 
-        max_bookmark_value = last_datetime
+    def fetch_ad_analytics(self, client, catalog, last_datetime, date_window_size, parent_id=None, params=None):
+        """
+        The API calls of sync_ad_analytics: every window's answers for one parent, as a list
+        of (pivot, responses) in window order. Writes nothing, so it can run on a worker
+        thread (`params` is this parent's own copy).
+        """
         last_datetime_dt = strptime_to_utc(last_datetime) - timedelta(days=7)
 
         # Prepare date window for API call
@@ -1123,7 +1193,7 @@ class LinkedInAds:
             window_start_date = window_end_date
 
         # Override the default start and end dates
-        static_params = {**self.params,
+        static_params = {**(self.params if params is None else params),
                          'dateRange.start.day': window_start_date.day,
                          'dateRange.start.month': window_start_date.month,
                          'dateRange.start.year': window_start_date.year,
@@ -1142,19 +1212,39 @@ class LinkedInAds:
         # If "count=100" and records=100 in the API are the same then the next URL will be returned and if we hit that URL, 400 error code will be returned.
         # This case is unreachable because here "count" is 10000 and at maximum, only 3000 records will be returned in an API response.
 
-        total_records = 0
+        windows = []
         while window_end_date <= today:
             responses = []
             for chunk in chunks:
                 static_params['fields'] = ','.join(chunk)
-                params = {"start": 0,
-                          **static_params}
-                query_string = '&'.join(['%s=%s' % (key, value) for (key, value) in params.items()])
+                query_params = {"start": 0,
+                                **static_params}
+                query_string = '&'.join(['%s=%s' % (key, value) for (key, value) in query_params.items()])
                 LOGGER.info('Syncing %s from %s to %s', parent_id, window_start_date, window_end_date)
                 for page in sync_analytics_endpoint(client, self.tap_stream_id, self.path, query_string):
                     if page.get(self.data_key):
                         responses.append(page.get(self.data_key))
-            pivot = params["pivot"] if "pivot" in params.keys() else None
+            pivot = query_params["pivot"] if "pivot" in query_params.keys() else None
+            windows.append((pivot, responses))
+
+            window_start_date, window_end_date, static_params = shift_sync_window(static_params, today, date_window_size)
+
+            # The window just synced ended on today: nothing is left to request.
+            if window_start_date > window_end_date:
+                break
+        return windows
+
+    def write_ad_analytics(self, client, catalog, last_datetime, windows, parent_id=None):
+        """
+        The writing half of sync_ad_analytics: merge, transform and write each window's
+        answers (from fetch_ad_analytics) in window order. Returns (records, bookmark).
+        """
+        bookmark_field = next(iter(self.replication_keys))
+        max_bookmark_value = last_datetime
+        last_datetime_dt = strptime_to_utc(last_datetime) - timedelta(days=7)
+
+        total_records = 0
+        for pivot, responses in windows:
             raw_records = merge_responses(pivot, responses, client, self.tap_stream_id, parent_id)
             time_extracted = utils.now()
 
@@ -1182,12 +1272,6 @@ class LinkedInAds:
                 LOGGER.info('%s, records processed: %s', self.tap_stream_id, record_count)
                 LOGGER.info('%s: max_bookmark: %s', self.tap_stream_id, max_bookmark_value)
                 total_records += record_count
-
-            window_start_date, window_end_date, static_params = shift_sync_window(static_params, today, date_window_size)
-
-            # The window just synced ended on today: nothing is left to request.
-            if window_start_date > window_end_date:
-                break
 
         return total_records, max_bookmark_value
 

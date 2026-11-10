@@ -608,8 +608,9 @@ class TestOneStreamErrorDoesNotStopTheOthers(MemberPivotTestCase):
             if name != failing:
                 self.assertEqual(capture.records[name], expected.records[name], name)
                 self.assertEqual(capture.states[-1]['bookmarks'][name], expected.states[-1]['bookmarks'][name])
-        # after the first 400 the failed stream is not asked again, for any campaign
-        self.assertEqual(sum('MEMBER_COMPANY_SIZE' in url for url in fake.urls), 1)
+        # after the first 400 the failed stream is not asked again: at most the calls
+        # already in flight on the 4 workers went out
+        self.assertLessEqual(sum('MEMBER_COMPANY_SIZE' in url for url in fake.urls), 4)
 
     def test_sync_finishes_every_other_stream_then_exits_non_zero(self):
         """The v1.4.0 failure: the account-wide call for company size gets LinkedIn's 400."""
@@ -676,6 +677,96 @@ class TestOneStreamErrorDoesNotStopTheOthers(MemberPivotTestCase):
                 mock.patch('singer.write_schema'), mock.patch('singer.write_state'):
             with self.assertRaises(LinkedInUnauthorizedError):
                 sync_mod.sync(object(), {'start_date': self.start_date, 'accounts': '1001'}, catalog, {})
+
+
+
+class TestPerCampaignConcurrency(MemberPivotTestCase):
+    """v1.4.2: the per-campaign MEMBER_* calls run up to max_concurrency at once."""
+
+    def legacy(self, **kwargs):
+        # The one-campaign-at-a-time loop the other analytics children still use.
+        with mock.patch.object(streams, 'MEMBER_PIVOT_STREAMS', []):
+            return run_campaigns_sync(self.fake(), self.catalog, json.loads(json.dumps(kwargs.get('state', {}))),
+                                      self.start_date, member_pivots_by_account=False,
+                                      window=kwargs.get('window', 30))
+
+    def test_same_records_and_state_as_the_sequential_path(self):
+        state = {'bookmarks': {name: (self.today - datetime.timedelta(days=20)).strftime('%Y-%m-%dT00:00:00Z')
+                               for name in MEMBER_STREAMS}}
+        for kwargs in ({}, {'state': state, 'window': 7}):
+            expected = self.legacy(**kwargs)
+            for concurrency in (1, 4, 8):
+                got = run_campaigns_sync(self.fake(), self.catalog, json.loads(json.dumps(kwargs.get('state', {}))),
+                                         self.start_date, member_pivots_by_account=True,
+                                         max_concurrency=concurrency, window=kwargs.get('window', 30))
+                self.assertEqual(got.records, expected.records, (kwargs, concurrency))  # same order too
+                self.assertEqual(got.states, expected.states, (kwargs, concurrency))
+
+    def test_same_output_order_whatever_order_calls_finish_in(self):
+        expected = self.legacy()
+        for seed in range(3):
+            rng = random.Random(seed)
+            lock = threading.Lock()
+
+            def jitter():
+                with lock:
+                    return rng.uniform(0, 0.004)
+            fake = self.fake(delay=jitter)
+            got = run_campaigns_sync(fake, self.catalog, {}, self.start_date,
+                                     member_pivots_by_account=True, max_concurrency=8)
+            self.assertGreater(fake.max_in_flight, 1)
+            self.assertLessEqual(fake.max_in_flight, 8)
+            self.assertEqual(got.records, expected.records)
+            self.assertEqual(got.states, expected.states)
+            self.assertFalse([url for url in fake.urls if 'q=statistics' in url])
+
+    def test_calls_run_at_once_up_to_max_concurrency(self):
+        for concurrency in (1, 2, 3):
+            fake = self.fake(delay=lambda: 0.003)
+            run_campaigns_sync(fake, self.catalog, {}, self.start_date, member_pivots_by_account=True,
+                               max_concurrency=concurrency)
+            self.assertEqual(fake.max_in_flight, concurrency)
+
+    def test_a_429_pauses_every_worker_and_the_call_is_retried(self):
+        expected = self.legacy()
+        sequential = self.fake()
+        run_campaigns_sync(sequential, self.catalog, {}, self.start_date, member_pivots_by_account=True,
+                           max_concurrency=1)
+
+        tripped = threading.Event()
+        client = LinkedinClient('id', 'secret', None, 'token', '1001,1002', None)
+        session = FakeSession(self.fake(), time.monotonic, tripped)
+        client._LinkedinClient__session = session  # pylint: disable=protected-access
+        gate = client.rate_gate
+        waits = []
+        real_wait, real_trip = gate.wait, gate.trip
+
+        def wait():
+            entered_after_trip = tripped.is_set()
+            waited = real_wait()
+            waits.append((threading.current_thread().name, entered_after_trip, waited, time.monotonic()))
+            return waited
+
+        def trip(retry_after=None):
+            pause = real_trip(retry_after)
+            tripped.set()
+            return pause
+
+        gate.wait, gate.trip = wait, trip
+        with mock.patch('backoff._sync.time.sleep'):
+            got = run_campaigns_sync(client, self.catalog, {}, self.start_date,
+                                     member_pivots_by_account=True, max_concurrency=4)
+
+        self.assertEqual(got.records, expected.records)  # nothing lost, same order
+        self.assertEqual(got.states, expected.states)
+        resume_at = gate._resume_at  # pylint: disable=protected-access
+        after = [w for w in waits if w[1]]
+        self.assertTrue(after)
+        self.assertTrue(all(now >= resume_at for _, _, _, now in after))
+        # the pause held back the other workers too (account 1001 has 3 campaigns at once)
+        paused_workers = {name for name, _, waited, _ in after if waited > 0 and 'linkedin-analytics' in name}
+        self.assertGreaterEqual(len(paused_workers), 2, waits)
+        self.assertEqual(session.calls, len(sequential.urls) + 1)  # one retry
 
 
 if __name__ == '__main__':

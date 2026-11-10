@@ -189,9 +189,11 @@ so the account-wide `CAMPAIGN` + member call v1.4.0 made gets HTTP 400 ("is not 
 symbol"). `"member_pivots_by_account"` (default true) only applies to a stream whose pivot that
 finder accepts; today none of these streams qualifies.
 
-The account-wide calls run up to `"max_concurrency"` at a time (default 4, at most 8). A 429 from
+The per-campaign calls of these streams run for up to `"max_concurrency"` campaigns at a time
+(default 4, at most 8; 1 is one campaign at a time), as would the account-wide calls. A 429 from
 LinkedIn pauses every request until LinkedIn's `Retry-After` (or 2, 4, 8 ... up to 60 seconds) has
-passed. Records are written in the same order whatever order the calls finish in.
+passed. Records and state are written in the same order as one campaign at a time, whatever order
+the calls finish in.
 
 If LinkedIn rejects one stream's request (HTTP 400, 403 or 404), that stream is skipped for the
 rest of the run, its bookmark is left where it was, and every other stream carries on. Once they
