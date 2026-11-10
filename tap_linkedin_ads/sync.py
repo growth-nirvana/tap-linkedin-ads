@@ -1,5 +1,6 @@
 import singer
-from tap_linkedin_ads.streams import STREAMS, write_bookmark, normalize_max_concurrency
+from tap_linkedin_ads.streams import (STREAMS, STREAM_ERRORS, StreamSyncErrors, write_bookmark,
+                                     normalize_max_concurrency, record_stream_failure)
 
 LOGGER = singer.get_logger()
 
@@ -80,9 +81,10 @@ def sync(client, config, catalog, state):
         date_window_size = DATE_WINDOW_SIZE
         LOGGER.info('Using standard date window size of %s', DATE_WINDOW_SIZE)
 
-    # MEMBER_* streams: one account-wide call per window instead of one per campaign
-    # (set member_pivots_by_account to false to go back to per-campaign calls), with up
-    # to max_concurrency analytics calls at once.
+    # member_pivots_by_account: one account-wide call per window instead of one per
+    # campaign, with up to max_concurrency analytics calls at once, for the streams whose
+    # pivot LinkedIn's statistics finder accepts. None of the MEMBER_* pivots is accepted
+    # (streams.STATISTICS_PIVOTS), so those streams take one call per campaign either way.
     member_pivots_by_account = str(config.get('member_pivots_by_account', True)).lower() not in ('false', '0', 'no', '')
     max_concurrency = normalize_max_concurrency(config.get('max_concurrency'))
     LOGGER.info('member_pivots_by_account: %s, max_concurrency: %s', member_pivots_by_account, max_concurrency)
@@ -103,6 +105,10 @@ def sync(client, config, catalog, state):
     # Get the list of streams(to sync stream itself or its child stream) for which
     # sync method needs to be called
     stream_to_sync = get_streams_to_sync(selected_streams)
+
+    # A stream whose request LinkedIn rejects is skipped and the others carry on; the tap
+    # exits non-zero once they are done (StreamSyncErrors).
+    failed_streams = {}
 
     # Loop through all `stream_to_sync` streams
     for stream_name in stream_to_sync:
@@ -135,16 +141,27 @@ def sync(client, config, catalog, state):
         if stream_name in selected_streams:
             stream_obj.write_schema(catalog)
 
-        total_records, max_bookmark_value = stream_obj.sync_endpoint(
-            client=client, catalog=catalog,
-            state=state, page_size=page_size,
-            start_date=start_date,
-            selected_streams=selected_streams,
-            date_window_size=date_window_size,
-            account_list=account_list,
-            skip_inactive_campaigns=not config.get('sync_inactive_campaigns', False),
-            member_pivots_by_account=member_pivots_by_account,
-            max_concurrency=max_concurrency)
+        try:
+            total_records, max_bookmark_value = stream_obj.sync_endpoint(
+                client=client, catalog=catalog,
+                state=state, page_size=page_size,
+                start_date=start_date,
+                selected_streams=selected_streams,
+                date_window_size=date_window_size,
+                account_list=account_list,
+                skip_inactive_campaigns=not config.get('sync_inactive_campaigns', False),
+                member_pivots_by_account=member_pivots_by_account,
+                max_concurrency=max_concurrency,
+                failed_streams=failed_streams)
+        except STREAM_ERRORS as error:
+            record_stream_failure(failed_streams, stream_name, error)
+            # Its selected children were not synced either.
+            for child_stream_name in stream_obj.children:
+                if child_stream_name in selected_streams:
+                    record_stream_failure(failed_streams, child_stream_name,
+                                          'not synced: its parent stream {} failed'.format(stream_name))
+            update_currently_syncing(state, None)
+            continue
 
         # Write parent stream's bookmarks
         if stream_obj.replication_keys and stream_name in selected_streams:
@@ -153,3 +170,6 @@ def sync(client, config, catalog, state):
         update_currently_syncing(state, None)
         LOGGER.info('Synced: %s, total_records: %s', stream_name, total_records)
         LOGGER.info('FINISHED Syncing: %s', stream_name)
+
+    if failed_streams:
+        raise StreamSyncErrors(failed_streams)
