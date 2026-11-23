@@ -1,6 +1,7 @@
 import singer
 from tap_linkedin_ads.streams import (STREAMS, STREAM_ERRORS, StreamSyncErrors, write_bookmark,
                                      normalize_max_concurrency, record_stream_failure)
+from tap_linkedin_ads import leads
 
 LOGGER = singer.get_logger()
 
@@ -110,6 +111,10 @@ def sync(client, config, catalog, state):
     # exits non-zero once they are done (StreamSyncErrors).
     failed_streams = {}
 
+    # Every stream that works per account gets the same list (the lead streams have no
+    # account_filter, so the block below does not set it for them).
+    account_list = config['accounts'].replace(" ", "").split(",") if config.get('accounts') else []
+
     # Loop through all `stream_to_sync` streams
     for stream_name in stream_to_sync:
         stream_obj = STREAMS[stream_name]()
@@ -141,6 +146,9 @@ def sync(client, config, catalog, state):
         if stream_name in selected_streams:
             stream_obj.write_schema(catalog)
 
+        # lead_sync_scope_granted: false (the token is known to lack the Lead Sync scope)
+        # skips lead_form_responses without asking LinkedIn.
+        lead_kwargs = {'lead_scope_granted': leads.scope_granted(config)} if stream_name == 'lead_form_responses' else {}
         try:
             total_records, max_bookmark_value = stream_obj.sync_endpoint(
                 client=client, catalog=catalog,
@@ -152,7 +160,8 @@ def sync(client, config, catalog, state):
                 skip_inactive_campaigns=not config.get('sync_inactive_campaigns', False),
                 member_pivots_by_account=member_pivots_by_account,
                 max_concurrency=max_concurrency,
-                failed_streams=failed_streams)
+                failed_streams=failed_streams,
+                **lead_kwargs)
         except STREAM_ERRORS as error:
             record_stream_failure(failed_streams, stream_name, error)
             # Its selected children were not synced either.

@@ -1,0 +1,202 @@
+{
+  "type": [
+    "null",
+    "object"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "response_id": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "lead_type": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "test_lead": {
+      "type": [
+        "null",
+        "boolean"
+      ]
+    },
+    "submitted_at": {
+      "type": [
+        "null",
+        "string"
+      ],
+      "format": "date-time"
+    },
+    "submitter": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "owner": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "account_id": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "sponsored_account_id": {
+      "type": [
+        "null",
+        "integer"
+      ]
+    },
+    "organization_id": {
+      "type": [
+        "null",
+        "integer"
+      ]
+    },
+    "versioned_lead_gen_form": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "lead_form_id": {
+      "type": [
+        "null",
+        "integer"
+      ]
+    },
+    "lead_form_version_id": {
+      "type": [
+        "null",
+        "integer"
+      ]
+    },
+    "sponsored_lead_metadata_campaign": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "campaign_id": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "campaign_name": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "campaign_type": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "associated_entity": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "creative_id": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "answers": {
+      "type": [
+        "null",
+        "array"
+      ],
+      "items": {
+        "type": [
+          "null",
+          "object"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "question_id": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          },
+          "name": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "text_question_answer": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "multiple_choice_options": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": [
+                "null",
+                "integer"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "consent_responses": {
+      "type": [
+        "null",
+        "array"
+      ],
+      "items": {
+        "type": [
+          "null",
+          "object"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "consent_id": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          },
+          "consent": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "accepted": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

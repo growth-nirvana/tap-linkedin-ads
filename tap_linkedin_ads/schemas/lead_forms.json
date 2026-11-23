@@ -1,0 +1,408 @@
+{
+  "type": [
+    "null",
+    "object"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": [
+        "null",
+        "integer"
+      ]
+    },
+    "version_id": {
+      "type": [
+        "null",
+        "integer"
+      ]
+    },
+    "version_tag": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "versioned_lead_gen_form": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "owner": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "account_id": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "sponsored_account_id": {
+      "type": [
+        "null",
+        "integer"
+      ]
+    },
+    "organization_id": {
+      "type": [
+        "null",
+        "integer"
+      ]
+    },
+    "name": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "state": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "created": {
+      "type": [
+        "null",
+        "string"
+      ],
+      "format": "date-time"
+    },
+    "last_modified": {
+      "type": [
+        "null",
+        "string"
+      ],
+      "format": "date-time"
+    },
+    "locale_country": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "locale_language": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "headline": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "headline_localized": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "description": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "description_localized": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "legal_info_legal_info_id": {
+      "type": [
+        "null",
+        "integer"
+      ]
+    },
+    "legal_info_privacy_policy_url": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "legal_info_legal_disclaimer": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "legal_info_legal_disclaimer_localized": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "post_submission_info_message": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "post_submission_info_message_localized": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "post_submission_info_call_to_action_label": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "post_submission_info_call_to_action_landing_page_url": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "review_info_review_status": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "review_info_last_updated": {
+      "type": [
+        "null",
+        "string"
+      ],
+      "format": "date-time"
+    },
+    "review_info_rejection_reasons": {
+      "type": [
+        "null",
+        "array"
+      ],
+      "items": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "hidden_fields": {
+      "type": [
+        "null",
+        "array"
+      ],
+      "items": {
+        "type": [
+          "null",
+          "object"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          },
+          "name": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "value": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        }
+      }
+    },
+    "questions": {
+      "type": [
+        "null",
+        "array"
+      ],
+      "items": {
+        "type": [
+          "null",
+          "object"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "question_id": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          },
+          "name": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "label": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "question": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "question_localized": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "text_prompt": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "predefined_field": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "response_editable": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "response_required": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "question_type": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "text_question_details_default_response": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "text_question_details_max_response_length": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          },
+          "multiple_choice_question_details_default_selected_option": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          },
+          "questions_submission_criteria_freemium_email_allowed": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "options": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": [
+                "null",
+                "object"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": [
+                    "null",
+                    "integer"
+                  ]
+                },
+                "label": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                },
+                "text": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                },
+                "text_localized": {
+                  "type": [
+                    "null",
+                    "string"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "consents": {
+      "type": [
+        "null",
+        "array"
+      ],
+      "items": {
+        "type": [
+          "null",
+          "object"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": [
+              "null",
+              "integer"
+            ]
+          },
+          "label": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "consent": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "consent_localized": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "check_required": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

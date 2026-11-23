@@ -10,7 +10,9 @@ from singer import Transformer, should_sync_field, UNIX_MILLISECONDS_INTEGER_DAT
 from singer.utils import strptime_to_utc, strftime
 from tap_linkedin_ads.transform import transform_json, snake_case_to_camel_case
 from tap_linkedin_ads.urn_resolver import resolve_urns
-from tap_linkedin_ads.client import LinkedInBadRequestError, LinkedInForbiddenError, LinkedInNotFoundError
+from tap_linkedin_ads.client import (LinkedInBadRequestError, LinkedInForbiddenError, LinkedInNotFoundError,
+                                     LinkedInUnauthorizedError)
+from tap_linkedin_ads import leads
 import json
 
 LOGGER = singer.get_logger()
@@ -1596,6 +1598,164 @@ class AdAnalyticsByPlacementName(LinkedInAds):
         "count": 10000
     }
 
+class LeadSyncStream(LinkedInAds):
+    """
+    Base of the Lead Sync streams: one owner finder (q=owner) per ad account, start/count
+    pages. A 403 (or a 401 about leads) for an account skips this stream for that account
+    only (leads.lead_access_denial); the other accounts and streams carry on.
+    """
+    path = None
+    data_key = "elements"
+    account_filter = None
+    headers = {'X-Restli-Protocol-Version': "2.0.0"}
+
+    def owner_params(self, account_id, window=None):
+        """The finder's query parameters for one account (before start/count)."""
+        raise NotImplementedError
+
+    def to_record(self, element):
+        raise NotImplementedError
+
+    def fetch_pages(self, client, account_id, page_size, window=None):
+        """Every page of the finder for one account, as lists of raw elements."""
+        start = 0
+        while True:
+            params = {**self.owner_params(account_id, window), 'start': start, 'count': page_size}
+            query = '&'.join('{}={}'.format(key, value) for key, value in params.items())
+            url = '{}/{}?{}'.format(BASE_URL, self.path, query)
+            LOGGER.info('URL for %s: %s', self.tap_stream_id, url)
+            data = client.get(url=url, endpoint=self.tap_stream_id, headers=dict(self.headers))
+            elements = data.get(self.data_key) or []
+            if elements:
+                yield elements
+            if leads.page_is_last(data, start, page_size):
+                return
+            start += len(elements)
+
+    def sync_account(self, client, catalog, account_id, page_size, last_datetime, window=None):
+        """Write one account's records. Returns (records, max bookmark)."""
+        total, max_bookmark = 0, last_datetime
+        for elements in self.fetch_pages(client, account_id, page_size, window):
+            records = [self.to_record(element) for element in elements]
+            max_bookmark, count = self.process_records(
+                catalog=catalog,
+                records=records,
+                time_extracted=utils.now(),
+                bookmark_field=next(iter(self.replication_keys)),
+                max_bookmark_value=max_bookmark,
+                last_datetime=last_datetime)
+            total += count
+        return total, max_bookmark
+
+
+class LeadForms(LeadSyncStream):
+    """
+    The lead gen forms each ad account owns (every version LinkedIn returns).
+    https://learn.microsoft.com/en-us/linkedin/marketing/lead-sync/leadsync#find-forms-by-owner
+    """
+    tap_stream_id = "lead_forms"
+    replication_method = "FULL_TABLE"
+    replication_keys = ["last_modified"]
+    key_properties = ["id"]
+    path = "leadForms"
+
+    def owner_params(self, account_id, window=None):
+        return {'q': 'owner', 'owner': leads.owner_param(account_id)}
+
+    def to_record(self, element):
+        return leads.lead_form_record(element)
+
+    # pylint: disable=too-many-arguments,unused-argument
+    def sync_endpoint(self, client, catalog, state, page_size, start_date, selected_streams,
+                      date_window_size, parent_id=None, account_list=None, failed_streams=None,
+                      **kwargs):
+        total = 0
+        max_bookmark = None
+        for account_id in account_list or []:
+            try:
+                count, bookmark = self.sync_account(client, catalog, account_id, page_size, None)
+            except (LinkedInForbiddenError, LinkedInUnauthorizedError) as error:
+                reason = leads.lead_access_denial(error)
+                if reason is None:
+                    raise
+                leads.log_lead_access_skip(self.tap_stream_id, account_id, reason, error)
+                continue
+            total += count
+            if bookmark and (max_bookmark is None or strptime_to_utc(bookmark) > strptime_to_utc(max_bookmark)):
+                max_bookmark = bookmark
+            LOGGER.info('%s: account %s: %s forms', self.tap_stream_id, account_id, count)
+        return total, max_bookmark or self.get_bookmark(state, start_date)
+
+
+class LeadFormResponses(LeadSyncStream):
+    """
+    The leads submitted to each ad account's forms (leadType SPONSORED), test leads included
+    (test_lead), incremental by submitted_at with one bookmark per account:
+    bookmarks.lead_form_responses = {"<account id>": "<submitted_at>"}. Each run asks
+    for submittedAtTimeRange from the account's bookmark less LEAD_RESPONSE_LOOKBACK_DAYS
+    (start_date for a new account) to now. An account LinkedIn refuses keeps its bookmark.
+    https://learn.microsoft.com/en-us/linkedin/marketing/lead-sync/leadsync#find-lead-form-responses-by-owner
+    """
+    tap_stream_id = "lead_form_responses"
+    replication_method = "INCREMENTAL"
+    replication_keys = ["submitted_at"]
+    key_properties = ["id"]
+    path = "leadFormResponses"
+
+    def owner_params(self, account_id, window=None):
+        params = {
+            'q': 'owner',
+            'owner': leads.owner_param(account_id),
+            'leadType': '(leadType:SPONSORED)',
+            'limitedToTestLeads': 'false',
+        }
+        if window:
+            params['submittedAtTimeRange'] = '(start:{},end:{})'.format(*window)
+        return params
+
+    def to_record(self, element):
+        return leads.lead_form_response_record(element)
+
+    def account_bookmarks(self, state):
+        value = (state or {}).get('bookmarks', {}).get(self.tap_stream_id)
+        return dict(value) if isinstance(value, dict) else {}
+
+    # pylint: disable=too-many-arguments,too-many-locals,unused-argument
+    def sync_endpoint(self, client, catalog, state, page_size, start_date, selected_streams,
+                      date_window_size, parent_id=None, account_list=None, failed_streams=None,
+                      lead_scope_granted=True, **kwargs):
+        bookmarks = self.account_bookmarks(state)
+        if not lead_scope_granted:
+            leads.log_lead_access_skip(
+                self.tap_stream_id, '*', 'scope',
+                'the sign-in was not granted {}; sign in again to grant lead access'.format(leads.LEAD_SYNC_SCOPES[0]))
+            return 0, bookmarks
+        now = utils.now()
+        end_ms = int(now.timestamp() * 1000)
+        total = 0
+        for account_id in account_list or []:
+            account_key = str(account_id)
+            last_datetime = bookmarks.get(account_key) or start_date
+            window_start = strptime_to_utc(last_datetime) - timedelta(days=leads.LEAD_RESPONSE_LOOKBACK_DAYS)
+            window = (int(window_start.timestamp() * 1000), end_ms)
+            try:
+                count, bookmark = self.sync_account(
+                    client, catalog, account_id, page_size, strftime(window_start), window)
+            except (LinkedInForbiddenError, LinkedInUnauthorizedError) as error:
+                reason = leads.lead_access_denial(error)
+                if reason is None:
+                    raise
+                leads.log_lead_access_skip(self.tap_stream_id, account_id, reason, error)
+                continue
+            total += count
+            # An account with no leads yet keeps no bookmark: it starts from start_date again.
+            if bookmark and strptime_to_utc(bookmark) > strptime_to_utc(last_datetime):
+                bookmarks[account_key] = bookmark
+            LOGGER.info('%s: account %s: %s responses since %s', self.tap_stream_id, account_id, count,
+                        strftime(window_start))
+        return total, bookmarks
+
+
 # Dictionary of the stream classes
 STREAMS = {
     "accounts": Accounts,
@@ -1614,5 +1774,7 @@ STREAMS = {
     "ad_analytics_by_member_country_v2": AdAnalyticsByMemberCountryV2,
     "ad_analytics_by_member_region_v2": AdAnalyticsByMemberRegionV2,
     "ad_analytics_by_member_company": AdAnalyticsByMemberCompany,
-    "ad_analytics_by_placement_name": AdAnalyticsByPlacementName
+    "ad_analytics_by_placement_name": AdAnalyticsByPlacementName,
+    "lead_forms": LeadForms,
+    "lead_form_responses": LeadFormResponses
 }
