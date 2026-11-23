@@ -107,6 +107,43 @@ This tap:
 - Transformations: Fields camelCase to snake_case. URNs to ids. Unix epoch millisecond integers to date-times. Audit date-times created_at and last_modified_at de-nested. Currency and cost fields strings to decimals. Pivot URN to creative and creative_id.
 - Parent: campaign
 
+[**lead_forms**](https://learn.microsoft.com/en-us/linkedin/marketing/lead-sync/leadsync#find-forms-by-owner)
+- Endpoint: https://api.linkedin.com/rest/leadForms (`q=owner`, owner = each ad account)
+- Primary key field: id (version_id and versioned_lead_gen_form are columns)
+- Foreign keys: account_id (accounts), organization_id
+- Replication strategy: Full table, per ad account (start/count pages)
+- Fields: Fivetran's LEAD_FORM_HISTORY columns; questions (with options), consents, hidden fields and
+  rejection reasons as nested arrays. Localized texts in the form's creation locale, plus every locale as JSON.
+- Required scope: `r_ads`; the member needs a role on the ad account (VIEWER and up).
+- Not selected by default.
+
+[**lead_form_responses**](https://learn.microsoft.com/en-us/linkedin/marketing/lead-sync/leadsync#find-lead-form-responses-by-owner)
+- Endpoint: https://api.linkedin.com/rest/leadFormResponses (`q=owner`, owner = each ad account,
+  `leadType=(leadType:SPONSORED)`, test leads included and flagged `test_lead`)
+- Primary key field: id
+- Foreign keys: account_id (accounts), lead_form_id + lead_form_version_id (lead_forms), campaign_id, creative_id
+- Replication strategy: Incremental per ad account: `submittedAtTimeRange` from the account's bookmark
+  less 1 day (start_date for a new account) to now. State: `bookmarks.lead_form_responses = {"<account id>": "<submitted_at>"}`.
+- Fields: Fivetran's LEAD_FORM_RESPONSE columns plus campaign and creative; answers (text and multiple choice
+  option ids) and consent responses as nested arrays.
+- Required scope: `r_marketing_leadgen_automation` (LinkedIn's Lead Sync program, approved separately from the
+  Advertising API). The member needs a role on the ad account AND one of ADMINISTRATOR, LEAD_GEN_FORMS_MANAGER,
+  CURATOR, CONTENT_ADMINISTRATOR or ANALYST on the company page tied to it.
+- Not selected by default.
+
+**Lead access is optional.** When LinkedIn refuses lead access for an ad account (403, or a 401 about leads:
+the token lacks the scope or the member lacks a role), that stream is skipped for that account only and the
+tap logs one line, then carries on; the run does not fail and the account keeps its bookmark:
+
+```
+WARNING LEAD ACCESS SKIPPED stream=lead_form_responses account=123 reason=scope: Not enough permissions to access: ...
+```
+
+`reason` is `scope` (sign in again to grant `r_marketing_leadgen_automation`) or `role` (the member needs a
+page or ad account role). If whoever runs the tap already knows the token lacks the scope (LinkedIn's token
+refresh answer lists the granted scopes), `"lead_sync_scope_granted": false` skips lead_form_responses without
+asking LinkedIn (`account=*`). A 401 that is not about leads still stops the run, as for every other stream.
+
 ## Authentication
 The tap uses a LinkedIn provided **access_token** in the config settings to make API requests. Access tokens expire after 60 days and require a user to manually authenticate again. If the tap receives a 401 invalid token response, the error logs will state that your access token has expired and to re-authenticate your connection to generate a new token.
 This is described more in [LinkedIn OAuth 2.0 Docs](https://docs.microsoft.com/en-us/linkedin/shared/authentication/authorization-code-flow?context=linkedin/context).
@@ -124,6 +161,8 @@ The API user account should be assigned the following **permissions** for the AP
     - rw_ads: read-write ads
 - ad_analytics_by_campaign, ad_analytics_by_creative:
     - r_ads_reporting: read ads reporting
+- lead_forms: r_ads
+- lead_form_responses: r_marketing_leadgen_automation (Lead Sync API), plus a company page role (see the stream)
 
 **NOTE**: Legacy permissions (r_ad_campaigns) have been migrated to the new permissions (r_ads and r_ads_reporting) based on this [permissions mapping](https://docs.microsoft.com/en-us/linkedin/shared/references/migrations/marketing-permissions-migration?context=linkedin/marketing/context). 
 
